@@ -1,0 +1,76 @@
+# Development docker-compose for SparkWorks
+#
+# Usage:
+#   docker compose -f docker-compose.dev.yml build
+#   docker compose -f docker-compose.dev.yml up        # headless with livestream
+#   docker compose -f docker-compose.dev.yml run sim    # interactive bash
+#
+# GUI mode (requires X11 forwarding — run `xhost +local:` first):
+#   docker compose -f docker-compose.dev.yml --profile gui up
+
+services:
+  sim:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: isaacsim-cad-dev:5.1.0
+    container_name: isaacsim-cad
+
+    # GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    network_mode: host
+
+    environment:
+      - ACCEPT_EULA=Y
+      - PRIVACY_CONSENT=Y
+
+    # Mount the extension source into the Isaac Sim extensions directory.
+    # Changes to your Python code are picked up on extension reload — no rebuild needed.
+    volumes:
+      # Extension source (live mount for development)
+      - ./source/extensions/sparkworks:/isaac-sim/exts/sparkworks:rw
+
+      # Isaac Sim caches (persist across runs to avoid re-warming shaders)
+      - ~/docker/isaac-sim/cache/main:/isaac-sim/.cache:rw
+      - ~/docker/isaac-sim/cache/computecache:/isaac-sim/.nv/ComputeCache:rw
+      - ~/docker/isaac-sim/logs:/isaac-sim/.nvidia-omniverse/logs:rw
+      - ~/docker/isaac-sim/config:/isaac-sim/.nvidia-omniverse/config:rw
+      - ~/docker/isaac-sim/data:/isaac-sim/.local/share/ov/data:rw
+      - ~/docker/isaac-sim/pkg:/isaac-sim/.local/share/ov/pkg:rw
+
+    # Default: headless with native livestream
+    entrypoint: ["/isaac-sim/runheadless.sh", "-v"]
+
+    # Add the extension search path so Kit discovers our extension
+    # --ext-folder adds a directory for Kit to scan for extensions
+    command: ["--ext-folder", "/isaac-sim/exts", "--enable", "sparkworks"]
+
+  # GUI profile — for local machines with a display
+  sim-gui:
+    extends:
+      service: sim
+    profiles: ["gui"]
+    container_name: isaacsim-cad-gui
+    environment:
+      - ACCEPT_EULA=Y
+      - PRIVACY_CONSENT=Y
+      - DISPLAY=${DISPLAY:-:0}
+    volumes:
+      - ./source/extensions/sparkworks:/isaac-sim/exts/sparkworks:rw
+      - ~/docker/isaac-sim/cache/main:/isaac-sim/.cache:rw
+      - ~/docker/isaac-sim/cache/computecache:/isaac-sim/.nv/ComputeCache:rw
+      - ~/docker/isaac-sim/logs:/isaac-sim/.nvidia-omniverse/logs:rw
+      - ~/docker/isaac-sim/config:/isaac-sim/.nvidia-omniverse/config:rw
+      - ~/docker/isaac-sim/data:/isaac-sim/.local/share/ov/data:rw
+      - ~/docker/isaac-sim/pkg:/isaac-sim/.local/share/ov/pkg:rw
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${XAUTHORITY:-~/.Xauthority}:/isaac-sim/.Xauthority:ro
+    entrypoint: ["/isaac-sim/runapp.sh"]
+    command: ["--ext-folder", "/isaac-sim/exts", "--enable", "sparkworks"]

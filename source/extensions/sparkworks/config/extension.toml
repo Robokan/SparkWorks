@@ -1,0 +1,50 @@
+[package]
+title = "SparkWorks"
+version = "0.1.0"
+description = "Fusion 360-style parametric CAD modeling environment for Isaac Sim. Sketch-based design, 3D feature operations, and a parametric timeline directly inside the simulator."
+category = "Simulation"
+changelog = "docs/CHANGELOG.md"
+icon = "data/icon.png"
+keywords = ["cad", "parametric", "modeling", "sketch", "extrude", "brep", "design", "sparkworks"]
+preview_image = "data/preview.png"
+readme = "docs/README.md"
+repository = ""
+
+[dependencies]
+"omni.kit.uiapp" = {}
+"omni.ui" = {}
+"omni.usd" = {}
+"omni.kit.commands" = {}
+"omni.kit.notification_manager" = {}
+
+[settings]
+exts."sparkworks".default_tessellation_tolerance = 0.001
+exts."sparkworks".default_angular_tolerance = 0.5
+
+[[python.module]]
+name = "sparkworks"
+
+# build123d is installed at the container level (Dockerfile.dev) rather than
+# via Kit's pipapi, because cadquery-ocp (the OCC bindings) has native
+# dependencies that need system libraries. If running outside a container,
+# install manually: /isaac-sim/python.sh -m pip install build123d numpy
+#
+# Uncomment the lines below to let Kit's pip manager auto-install at extension
+# enable time (works if system deps like libgl1 are already present):
+# [python.pipapi]
+# requirements = ["build123d", "numpy"]
+# use_online_index = true
+
+[documentation]
+pages = [
+    "docs/Overview.md",
+    "docs/CHANGELOG.md",
+]
+
+[[test]]
+dependencies = [
+    "omni.kit.test",
+    "omni.kit.ui_test",
+]
+
+args = []

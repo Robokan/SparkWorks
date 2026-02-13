@@ -1,0 +1,41 @@
+# Development Dockerfile for SparkWorks
+#
+# Based on the official Isaac Sim 5.1.0 container with build123d installed.
+# Mount your extension source at runtime via docker-compose.dev.yml.
+#
+# Build:   docker build -f Dockerfile.dev -t isaacsim-cad-dev .
+# Run:     docker compose -f docker-compose.dev.yml up
+
+FROM nvcr.io/nvidia/isaac-sim:5.1.0
+
+USER root
+
+# System dependencies for Open Cascade / build123d rendering
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        libgl1 \
+        libglib2.0-0 \
+        libxrender1 \
+        libxext6 \
+    && apt-get -y autoremove \
+    && apt-get clean autoclean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install build123d + numpy into the Kit Python environment
+# build123d automatically pulls cadquery-ocp (OCC Python bindings)
+RUN /isaac-sim/python.sh -m pip install --no-cache-dir \
+        build123d \
+        numpy
+
+# Create directory for the extension to be mounted into
+RUN mkdir -p /isaac-sim/exts/sparkworks \
+    && chown -R 1234:1234 /isaac-sim/exts/sparkworks
+
+# Switch back to Isaac Sim's rootless user
+USER 1234
+WORKDIR /isaac-sim
+
+# Default: open a bash shell for interactive development
+ENTRYPOINT ["/bin/bash"]

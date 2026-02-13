@@ -1,43 +1,48 @@
-# This Dockerfile is used as the base for containerizing applications rendered out via repo_kit_template.
+# SparkWorks — Isaac Sim 5.1.0 Container
+#
+# Base image: NVIDIA Isaac Sim 5.1.0 (Kit 107.3.3)
+# Adds: build123d (Open Cascade Python bindings) for parametric CAD modeling
+#
+# The template variables ($KIT_FILE_NAME_BREADCRUMB, $KIT_ARGS_BREADCRUMB) are
+# replaced by the repo_kit_template packaging tool when building a fat package.
+# For development, use docker-compose.dev.yml instead.
 
-# This is the base image for the container. It is based on Ubuntu 22.04.
-FROM nvcr.io/nvidia/omniverse/ov-base-ubuntu-22:2025.2.0
+FROM nvcr.io/nvidia/isaac-sim:5.1.0
 
-# root user to bootstrap the container
+# Switch to root to install system deps and pip packages
 USER root
-# install curl
-RUN apt update \
-    && DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
+
+# Install system dependencies needed by Open Cascade / build123d
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         curl \
-    && apt -y autoremove \
-    && apt clean autoclean \
+        libgl1 \
+        libglib2.0-0 \
+        libxrender1 \
+        libxext6 \
+    && apt-get -y autoremove \
+    && apt-get clean autoclean \
     && rm -rf /var/lib/apt/lists/*
 
-# Create local user
-RUN useradd --create-home --shell /bin/bash ubuntu || echo "User already exists."
-# Create the 'ubuntu' user and add it to the 'sudo' group
-RUN usermod -aG sudo ubuntu
-# nopasswd sudo
-RUN mkdir -p /etc/sudoers.d/
-RUN echo "ubuntu ALL=(ALL:ALL) NOPASSWD: ALL" | tee /etc/sudoers.d/ubuntu
+# Install build123d (pulls in cadquery-ocp / Open Cascade bindings automatically)
+# Using the Kit-bundled Python to ensure compatibility
+RUN /isaac-sim/python.sh -m pip install --no-cache-dir \
+        build123d \
+        numpy
 
-# Copy the staged fat package into the /app directory
+# Copy the staged fat package into /app (for packaged deployment)
 COPY --chown=root:root --chmod=555 package /app/
-
-USER ubuntu
-WORKDIR /app
 
 # Copy the container entrypoint script
 COPY --chown=root:root --chmod=555 entrypoint.sh /entrypoint.sh
 
-# Create Kit expected caching directories that we'll map a volume onto.
-RUN mkdir -p /home/ubuntu/.cache/ov
-RUN mkdir -p /home/ubuntu/.local/share/ov
-RUN mkdir -p /home/ubuntu/.nvidia-omniverse/config
-
 # Create StreamSDK extended timeout config file
-RUN mkdir -p /home/ubuntu/.config
-COPY --chown=root:root --chmod=555 stream_sdk.txt /home/ubuntu/.config/regkeys.txt
+RUN mkdir -p /isaac-sim/.config
+COPY --chown=root:root --chmod=555 stream_sdk.txt /isaac-sim/.config/regkeys.txt
+
+# Switch back to the Isaac Sim rootless user (UID 1234)
+USER 1234
+WORKDIR /isaac-sim
 
 # Label for discovering kit_app_template built images within the docker registry.
 LABEL kit_app_template=$KIT_FILE_NAME_BREADCRUMB

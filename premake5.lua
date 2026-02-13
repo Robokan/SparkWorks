@@ -25,6 +25,11 @@ repo_build.prebuild_link {
     {"source/standalone_examples", "_build/%{platform}/%{config}/standalone_examples" },
 }
 
+-- Symlink SparkWorks extension
+repo_build.prebuild_link {
+    {"source/extensions/sparkworks", "_build/%{platform}/%{config}/exts/sparkworks" },
+}
+
 -- Isaac Sim default apps
 define_app("isaacsim.exp.base.kit")
 define_app("isaacsim.exp.base.xr.vr.kit")
