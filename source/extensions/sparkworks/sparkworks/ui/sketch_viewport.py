@@ -74,6 +74,9 @@ class SketchViewport:
         # Preview state (rubber-band line)
         self._preview_from: Optional[Tuple[float, float]] = None
         self._preview_to: Optional[Tuple[float, float]] = None
+        # Preview state (rectangle)
+        self._preview_rect_c1: Optional[Tuple[float, float]] = None
+        self._preview_rect_c2: Optional[Tuple[float, float]] = None
         # Placed points (green dots)
         self._placed_points: List[Tuple[float, float]] = []
 
@@ -189,9 +192,21 @@ class SketchViewport:
     def set_placed_points(self, points: List[Tuple[float, float]]):
         self._placed_points = list(points)
 
+    def set_preview_rect(
+        self,
+        corner1: Optional[Tuple[float, float]],
+        corner2: Optional[Tuple[float, float]],
+    ):
+        """Set a rectangle preview (two opposite corners)."""
+        self._preview_rect_c1 = corner1
+        self._preview_rect_c2 = corner2
+        self._redraw()
+
     def clear_preview(self):
         self._preview_from = None
         self._preview_to = None
+        self._preview_rect_c1 = None
+        self._preview_rect_c2 = None
         self._placed_points = []
         self._redraw()
 
@@ -364,6 +379,22 @@ class SketchViewport:
                     color=PREVIEW_COLOR,
                     thickness=2.0,
                 )
+
+            # Rectangle preview (4 edges)
+            if self._preview_rect_c1 is not None and self._preview_rect_c2 is not None:
+                x1, y1 = self._preview_rect_c1
+                x2, y2 = self._preview_rect_c2
+                corners = [
+                    (x1, y1, 0), (x2, y1, 0),
+                    (x2, y2, 0), (x1, y2, 0),
+                ]
+                for i in range(4):
+                    sc.Line(
+                        corners[i],
+                        corners[(i + 1) % 4],
+                        color=PREVIEW_COLOR,
+                        thickness=2.0,
+                    )
 
     def _draw_point_marker(self, pt: Tuple[float, float]):
         size = VIEW_EXTENT * 0.015

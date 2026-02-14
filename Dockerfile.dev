@@ -24,7 +24,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Install build123d + numpy into the Kit Python environment
-# build123d automatically pulls cadquery-ocp (OCC Python bindings)
+# cadquery-ocp 7.9.3 is the only version available on aarch64.
+# build123d 0.8 + OCP 7.9 have a HashCode incompatibility which we
+# monkey-patch at extension startup (see kernel/_ocp_compat.py).
 RUN /isaac-sim/python.sh -m pip install --no-cache-dir \
         build123d \
         numpy

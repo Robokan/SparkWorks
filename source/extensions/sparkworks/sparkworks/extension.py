@@ -81,6 +81,8 @@ class ParametricCadExtension(omni.ext.IExt):
         self._active_sketch: Optional[Sketch] = None
         self._sketch_counter = 0
         self._feature_counter = 0
+        self._body_counter = 0
+        self._current_body_name = "Body1"
 
         # -- Sketch tool manager (interactive drawing state machine) ----
         self._sketch_tool = SketchToolManager()
@@ -269,7 +271,7 @@ class ParametricCadExtension(omni.ext.IExt):
     # ========================================================================
 
     async def _create_initial_planes(self):
-        """Wait for the stage, then create the three origin construction planes."""
+        """Wait for the stage, then create construction planes and load saved timeline."""
         # Give the stage a few frames to be ready
         for _ in range(30):
             await omni.kit.app.get_app().next_update_async()
@@ -282,6 +284,28 @@ class ParametricCadExtension(omni.ext.IExt):
             print(f"[{EXTENSION_NAME}] Origin planes created: {list(result.keys())}")
         except Exception as e:
             print(f"[{EXTENSION_NAME}] Failed to create origin planes: {e}")
+
+        # Try to load a previously saved timeline from the USD stage
+        self._load_timeline_from_usd()
+
+    def _load_timeline_from_usd(self):
+        """Load timeline from USD prims if a saved timeline exists on the stage."""
+        try:
+            features = self._bridge.load_timeline()
+            if features and len(features) > 0:
+                from .timeline.timeline import Timeline
+                self._timeline = Timeline()
+                self._connect_timeline_callbacks()
+                for feature in features:
+                    self._timeline._features.append(feature)
+                self._timeline._notify_changed()
+                # Rebuild to restore geometry
+                self._timeline.rebuild_all()
+                self._set_status(f"Restored {len(features)} features from saved stage")
+                _notify(f"Loaded {len(features)} features from stage.")
+                print(f"[{EXTENSION_NAME}] Restored {len(features)} features from USD")
+        except Exception as e:
+            print(f"[{EXTENSION_NAME}] No saved timeline to load (or error): {e}")
 
     def _subscribe_selection_changed(self):
         """Subscribe to USD selection changes to detect plane clicks."""
@@ -384,15 +408,26 @@ class ParametricCadExtension(omni.ext.IExt):
     # ========================================================================
 
     def _on_tool_primitive_created(self, primitive):
-        """Called when the sketch tool completes a primitive (e.g. a line segment)."""
+        """Called when the sketch tool completes a primitive (line, rect, circle)."""
         if self._active_sketch is None:
             return
 
-        from .kernel.sketch import SketchLine
+        from .kernel.sketch import SketchLine, SketchRect, SketchCircle
 
         if isinstance(primitive, SketchLine):
             self._active_sketch.add_line(
                 start=primitive.start, end=primitive.end
+            )
+        elif isinstance(primitive, SketchRect):
+            self._active_sketch.add_rectangle(
+                width=primitive.width,
+                height=primitive.height,
+                center=primitive.center,
+            )
+        elif isinstance(primitive, SketchCircle):
+            self._active_sketch.add_circle(
+                radius=primitive.radius,
+                center=primitive.center,
             )
 
         prim_idx = len(self._active_sketch.primitives) - 1
@@ -405,13 +440,24 @@ class ParametricCadExtension(omni.ext.IExt):
 
     def _on_tool_preview_changed(self):
         """Called when the rubber-band preview or placed-points change."""
+        self._sketch_viewport.set_placed_points(self._sketch_tool.points)
+
+        # Rectangle preview
+        rect_preview = self._sketch_tool.preview_rect
+        if rect_preview:
+            c1, c2 = rect_preview
+            self._sketch_viewport.set_preview_rect(c1, c2)
+            self._sketch_viewport.set_preview_line(None, None)
+            return
+        else:
+            self._sketch_viewport.set_preview_rect(None, None)
+
+        # Line preview (also used for circle radius preview)
         preview = self._sketch_tool.preview_line
         if preview:
             from_pt, to_pt = preview
-            self._sketch_viewport.set_placed_points(self._sketch_tool.points)
             self._sketch_viewport.set_preview_line(from_pt, to_pt)
         else:
-            self._sketch_viewport.set_placed_points(self._sketch_tool.points)
             self._sketch_viewport.set_preview_line(None, None)
 
     def _on_tool_chain_cancelled(self, count: int):
@@ -463,11 +509,6 @@ class ParametricCadExtension(omni.ext.IExt):
             self._set_status("No active sketch to finish")
             _notify("No active sketch to finish.", "warning")
             return
-        if not self._active_sketch.primitives:
-            self._set_status("Sketch is empty — draw something first")
-            _notify("Sketch is empty.", "warning")
-            return
-
         count = len(self._active_sketch.primitives)
         name = self._active_sketch.name
 
@@ -477,7 +518,12 @@ class ParametricCadExtension(omni.ext.IExt):
             _notify(f"Sketch '{name}' added with {count} primitives.")
         except Exception as e:
             print(f"[{EXTENSION_NAME}] Error adding sketch to timeline: {e}")
+            import traceback
+            traceback.print_exc()
             self._set_status(f"'{name}' saved ({count} primitives)")
+
+        # Explicit save to USD (safety net if callback chain had issues)
+        self._save_timeline_to_usd()
 
         # Always reset state — button label, viewport, tools
         self._active_sketch = None
@@ -506,7 +552,6 @@ class ParametricCadExtension(omni.ext.IExt):
             return
         self._sketch_tool.activate_tool(SketchToolMode.RECTANGLE)
         self._toolbar.set_active_tool("rectangle")
-        self._set_status("Rectangle tool — not yet implemented (coming soon)")
 
     def _action_tool_circle(self):
         if self._active_sketch is None:
@@ -515,7 +560,6 @@ class ParametricCadExtension(omni.ext.IExt):
             return
         self._sketch_tool.activate_tool(SketchToolMode.CIRCLE)
         self._toolbar.set_active_tool("circle")
-        self._set_status("Circle tool — not yet implemented (coming soon)")
 
     # -- 3D operations --------------------------------------------------------
 
@@ -526,11 +570,13 @@ class ParametricCadExtension(omni.ext.IExt):
             return
         dist = self._toolbar.extrude_distance
         self._feature_counter += 1
+        self._body_counter += 1
         op = ExtrudeOperation(distance=dist)
         op.name = f"Extrude{self._feature_counter}"
+        self._current_body_name = f"Body{self._body_counter}"
         self._set_status(f"Extruding {dist} units...")
         self._timeline.add_operation(op, name=op.name)
-        self._set_status(f"Extrude (d={dist}) complete — mesh in viewport")
+        self._set_status(f"Extrude (d={dist}) complete — {self._current_body_name} created")
 
     def _action_revolve(self):
         if not self._timeline.features:
@@ -581,6 +627,8 @@ class ParametricCadExtension(omni.ext.IExt):
         self._selected_plane = None
         self._sketch_counter = 0
         self._feature_counter = 0
+        self._body_counter = 0
+        self._current_body_name = "Body1"
         self._sketch_tool.deactivate()
         self._toolbar.set_active_tool(None)
         self._toolbar.set_sketch_mode(False)
@@ -633,15 +681,35 @@ class ParametricCadExtension(omni.ext.IExt):
     # ========================================================================
 
     def _on_timeline_rebuild(self, solid):
-        prim_path = self._bridge.update_mesh(solid, prim_name="ActivePart")
-        if prim_path:
-            print(f"[{EXTENSION_NAME}] Mesh updated at {prim_path}")
+        if solid is not None:
+            body_name = getattr(self, '_current_body_name', 'Body1')
+            prim_path = self._bridge.update_body_mesh(solid, body_name=body_name)
+            if prim_path:
+                print(f"[{EXTENSION_NAME}] Body '{body_name}' updated at {prim_path}")
         self._timeline_panel.update_features(
             self._timeline.features,
             self._timeline.scrub_index,
         )
 
     def _on_features_changed(self, features):
-        self._timeline_panel.update_features(
-            features, self._timeline.scrub_index
-        )
+        try:
+            self._timeline_panel.update_features(
+                features, self._timeline.scrub_index
+            )
+        except Exception as e:
+            print(f"[{EXTENSION_NAME}] Timeline panel update error: {e}")
+
+        # Always persist timeline to USD, even if panel update failed
+        self._save_timeline_to_usd()
+
+    def _save_timeline_to_usd(self):
+        """Save the current timeline features to USD prims."""
+        try:
+            features = self._timeline.features if self._timeline else []
+            success = self._bridge.save_timeline(features)
+            if not success:
+                print(f"[{EXTENSION_NAME}] save_timeline returned False")
+        except Exception as e:
+            print(f"[{EXTENSION_NAME}] Failed to save timeline to USD: {e}")
+            import traceback
+            traceback.print_exc()

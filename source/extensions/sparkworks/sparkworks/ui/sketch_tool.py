@@ -12,7 +12,7 @@ from __future__ import annotations
 from enum import Enum, auto
 from typing import Callable, List, Optional, Tuple
 
-from ..kernel.sketch import SketchLine
+from ..kernel.sketch import SketchLine, SketchRect, SketchCircle
 
 
 class SketchToolMode(Enum):
@@ -67,12 +67,24 @@ class SketchToolManager:
     @property
     def preview_line(self) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
         """Return (from_pt, to_pt) for rubber-band rendering, or None."""
+        if self._cursor_pos is None or not self._points:
+            return None
+        if self._active_tool == SketchToolMode.LINE:
+            return (self._points[-1], self._cursor_pos)
+        if self._active_tool == SketchToolMode.RECTANGLE:
+            # Preview the diagonal of the rectangle
+            return (self._points[0], self._cursor_pos)
+        return None
+
+    @property
+    def preview_rect(self) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+        """Return (corner1, corner2) for rectangle preview, or None."""
         if (
-            self._active_tool == SketchToolMode.LINE
+            self._active_tool == SketchToolMode.RECTANGLE
             and self._points
             and self._cursor_pos is not None
         ):
-            return (self._points[-1], self._cursor_pos)
+            return (self._points[0], self._cursor_pos)
         return None
 
     @property
@@ -89,7 +101,11 @@ class SketchToolManager:
         self._cursor_pos = None
         self._chain_prim_count = 0
         if mode == SketchToolMode.LINE:
-            self._emit_status("Line tool active — click to place first point")
+            self._emit_status("Line tool — click to place first point")
+        elif mode == SketchToolMode.RECTANGLE:
+            self._emit_status("Rectangle tool — click first corner")
+        elif mode == SketchToolMode.CIRCLE:
+            self._emit_status("Circle tool — click to place center")
         elif mode == SketchToolMode.NONE:
             self._emit_status("Ready")
         else:
@@ -99,11 +115,11 @@ class SketchToolManager:
         """Deactivate whatever tool is active."""
         self.activate_tool(SketchToolMode.NONE)
 
-    def on_click(self, world_x: float, world_y: float) -> Optional[SketchLine]:
+    def on_click(self, world_x: float, world_y: float):
         """
         Handle a left-click at the given world coordinates.
 
-        Returns the completed ``SketchLine`` if a segment was finished,
+        Returns the completed primitive if an action was finished,
         or ``None`` if we're still accumulating points.
         """
         if self._active_tool == SketchToolMode.NONE:
@@ -111,8 +127,11 @@ class SketchToolManager:
 
         if self._active_tool == SketchToolMode.LINE:
             return self._line_click(world_x, world_y)
+        elif self._active_tool == SketchToolMode.RECTANGLE:
+            return self._rect_click(world_x, world_y)
+        elif self._active_tool == SketchToolMode.CIRCLE:
+            return self._circle_click(world_x, world_y)
 
-        # Future: RECTANGLE, CIRCLE
         return None
 
     def on_mouse_move(self, world_x: float, world_y: float):
@@ -134,6 +153,14 @@ class SketchToolManager:
                 self._chain_prim_count = 0
                 self._emit_status("Line chain finished — click to start a new line")
             # Tool remains LINE
+        elif self._active_tool == SketchToolMode.RECTANGLE:
+            self._points.clear()
+            self._chain_prim_count = 0
+            self._emit_status("Rectangle done — click to start another")
+        elif self._active_tool == SketchToolMode.CIRCLE:
+            self._points.clear()
+            self._chain_prim_count = 0
+            self._emit_status("Circle done — click to place another")
         if self.on_preview_changed:
             self.on_preview_changed()
 
@@ -187,6 +214,86 @@ class SketchToolManager:
         if self.on_preview_changed:
             self.on_preview_changed()
         return line
+
+    # -- Internal rectangle tool -----------------------------------------------
+
+    def _rect_click(self, wx: float, wy: float):
+        """Handle a click while the RECTANGLE tool is active."""
+        pt = (wx, wy)
+
+        if not self._points:
+            # First corner
+            self._points.append(pt)
+            self._emit_status(
+                f"Corner 1 ({wx:.1f}, {wy:.1f}) — click opposite corner"
+            )
+            if self.on_preview_changed:
+                self.on_preview_changed()
+            return None
+
+        # Second corner — complete the rectangle
+        c1 = self._points[0]
+        c2 = pt
+        cx = (c1[0] + c2[0]) / 2.0
+        cy = (c1[1] + c2[1]) / 2.0
+        w = abs(c2[0] - c1[0])
+        h = abs(c2[1] - c1[1])
+
+        if w < 0.001 or h < 0.001:
+            self._emit_status("Rectangle too small — click a different point")
+            return None
+
+        rect = SketchRect(center=(cx, cy), width=w, height=h)
+        self._points.clear()
+        self._chain_prim_count += 1
+        self._emit_status(
+            f"Rectangle {w:.1f} x {h:.1f} at ({cx:.1f}, {cy:.1f}) — click for another"
+        )
+
+        if self.on_primitive_created:
+            self.on_primitive_created(rect)
+        if self.on_preview_changed:
+            self.on_preview_changed()
+        return rect
+
+    # -- Internal circle tool --------------------------------------------------
+
+    def _circle_click(self, wx: float, wy: float):
+        """Handle a click while the CIRCLE tool is active."""
+        pt = (wx, wy)
+
+        if not self._points:
+            # Center point
+            self._points.append(pt)
+            self._emit_status(
+                f"Center ({wx:.1f}, {wy:.1f}) — click to set radius"
+            )
+            if self.on_preview_changed:
+                self.on_preview_changed()
+            return None
+
+        # Second click — radius
+        center = self._points[0]
+        dx = pt[0] - center[0]
+        dy = pt[1] - center[1]
+        radius = (dx * dx + dy * dy) ** 0.5
+
+        if radius < 0.001:
+            self._emit_status("Radius too small — click farther away")
+            return None
+
+        circle = SketchCircle(center=center, radius=radius)
+        self._points.clear()
+        self._chain_prim_count += 1
+        self._emit_status(
+            f"Circle r={radius:.1f} at ({center[0]:.1f}, {center[1]:.1f}) — click for another"
+        )
+
+        if self.on_primitive_created:
+            self.on_primitive_created(circle)
+        if self.on_preview_changed:
+            self.on_preview_changed()
+        return circle
 
     # -- Helpers --------------------------------------------------------------
 

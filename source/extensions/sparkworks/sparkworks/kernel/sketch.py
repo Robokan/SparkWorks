@@ -224,6 +224,16 @@ class Sketch:
         if not self.primitives:
             return None
 
+        # Check if we have any buildable primitives (rects/circles)
+        # Lines and arcs alone cannot form a face without a closed wire
+        buildable = [p for p in self.primitives
+                     if isinstance(p, (SketchRect, SketchCircle))]
+
+        if not buildable:
+            # Only lines/arcs — cannot build a face yet (need closed wire support)
+            print(f"[SparkWorks] Sketch '{self.name}' has no closed profiles to build")
+            return None
+
         # If we have a single rectangle or circle, use the fast path
         if len(self.primitives) == 1:
             prim = self.primitives[0]
@@ -232,7 +242,7 @@ class Sketch:
             elif isinstance(prim, SketchCircle):
                 return self._build_circle_face(prim)
 
-        # General case: build sketch with all primitives
+        # General case: build sketch with buildable primitives
         return self._build_compound_face()
 
     def _build_rect_face(self, rect: SketchRect):
