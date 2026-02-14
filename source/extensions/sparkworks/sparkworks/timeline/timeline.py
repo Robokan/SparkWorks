@@ -278,6 +278,8 @@ class Timeline:
                 # Execute the operation with current context
                 context.sketch_face = self._current_sketch_face
                 context.current_solid = self._current_solid
+                # Pass the existing solid as join target for face-on-body extrudes
+                context.join_solid = self._current_solid
                 feature.operation.execute(context)
                 self._current_solid = context.current_solid
 

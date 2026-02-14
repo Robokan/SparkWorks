@@ -70,6 +70,7 @@ class OperationContext:
     """
     current_solid: Optional[Part] = None
     sketch_face = None  # The Face from the active sketch
+    join_solid: Optional[Part] = None  # Existing solid to fuse into (sketch-on-face)
 
 
 # ---------------------------------------------------------------------------
@@ -86,11 +87,14 @@ class ExtrudeOperation(BaseOperation):
         symmetric: If True, extrude distance/2 in both directions
         both: If True, also extrude in the negative direction by neg_distance
         neg_distance: Distance for the negative direction (used when both=True)
+        join: If True, fuse the extruded solid with ``context.join_solid``
+              (used when sketching on a body face).
     """
     distance: float = 10.0
     symmetric: bool = False
     both: bool = False
     neg_distance: float = 0.0
+    join: bool = False
     op_type: OperationType = field(default=OperationType.EXTRUDE, init=False)
 
     def execute(self, context: OperationContext):
@@ -103,17 +107,26 @@ class ExtrudeOperation(BaseOperation):
             half = self.distance / 2.0
             with BuildPart() as part:
                 extrude(sketch_face, amount=half, both=True)
-            context.current_solid = part.part
+            new_solid = part.part
         elif self.both:
-            # Extrude in positive direction, then negative
             with BuildPart() as part:
                 extrude(sketch_face, amount=self.distance)
-            # For simplicity in Phase 1, use both=True with max distance
-            context.current_solid = part.part
+            new_solid = part.part
         else:
             with BuildPart() as part:
                 extrude(sketch_face, amount=self.distance)
-            context.current_solid = part.part
+            new_solid = part.part
+
+        # If join mode is active and there's an existing solid, fuse them
+        if self.join and context.join_solid is not None and new_solid is not None:
+            try:
+                context.current_solid = context.join_solid.fuse(new_solid).clean()
+                print("[SparkWorks] Fused new extrusion with parent body")
+            except Exception as e:
+                print(f"[SparkWorks] Boolean fuse failed, keeping new solid: {e}")
+                context.current_solid = new_solid
+        else:
+            context.current_solid = new_solid
 
     def to_dict(self) -> dict:
         return {
@@ -123,6 +136,7 @@ class ExtrudeOperation(BaseOperation):
             "symmetric": self.symmetric,
             "both": self.both,
             "neg_distance": self.neg_distance,
+            "join": self.join,
             "suppressed": self.suppressed,
         }
 
@@ -133,6 +147,7 @@ class ExtrudeOperation(BaseOperation):
             symmetric=d.get("symmetric", False),
             both=d.get("both", False),
             neg_distance=d.get("neg_distance", 0.0),
+            join=d.get("join", False),
         )
         op.name = d.get("name", "Extrude")
         op.suppressed = d.get("suppressed", False)

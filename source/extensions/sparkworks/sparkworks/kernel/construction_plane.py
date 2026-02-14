@@ -42,6 +42,7 @@ class ConstructionPlane:
     offset: float = 0.0
     rotation: float = 0.0
     size: float = 1.0
+    size_v: Optional[float] = None  # If set, quad uses size x size_v (rectangular)
     color: Tuple[float, float, float] = (0.2, 0.4, 0.9)
     opacity: float = 0.15
     prim_path: str = ""
@@ -101,22 +102,31 @@ class ConstructionPlane:
             ux, uy, uz = ux2, uy2, uz2
             vx, vy, vz = vx2, vy2, vz2
 
-        s = self.size
+        su = self.size                            # half-extent along U
+        sv = self.size_v if self.size_v is not None else su  # half-extent along V
         cx, cy, cz = self.world_origin
 
         return [
-            (cx - s * ux - s * vx, cy - s * uy - s * vy, cz - s * uz - s * vz),
-            (cx + s * ux - s * vx, cy + s * uy - s * vy, cz + s * uz - s * vz),
-            (cx + s * ux + s * vx, cy + s * uy + s * vy, cz + s * uz + s * vz),
-            (cx - s * ux + s * vx, cy - s * uy + s * vy, cz - s * uz + s * vz),
+            (cx - su * ux - sv * vx, cy - su * uy - sv * vy, cz - su * uz - sv * vz),
+            (cx + su * ux - sv * vx, cy + su * uy - sv * vy, cz + su * uz - sv * vz),
+            (cx + su * ux + sv * vx, cy + su * uy + sv * vy, cz + su * uz + sv * vz),
+            (cx - su * ux + sv * vx, cy - su * uy + sv * vy, cz - su * uz + sv * vz),
         ]
 
     def to_build123d_plane(self) -> Plane:
         """
         Convert to a ``build123d.Plane`` suitable for sketch construction.
 
-        Handles base plane type, offset, and rotation.
+        Handles base plane type, offset, rotation, and CUSTOM planes defined
+        by an arbitrary origin + normal.
         """
+        if self.plane_type == "CUSTOM":
+            # Arbitrary plane from origin + normal
+            return Plane(
+                origin=Vector(*self.world_origin),
+                z_dir=Vector(*self.normal),
+            )
+
         base_planes = {
             "XY": Plane.XY,
             "XZ": Plane.XZ,
@@ -131,6 +141,157 @@ class ConstructionPlane:
             base = base.rotated((0, 0, self.rotation))
 
         return base
+
+
+# ---------------------------------------------------------------------------
+# Face-plane extraction from build123d solids
+# ---------------------------------------------------------------------------
+
+# Colours assigned to face planes in rotation
+_FACE_COLORS = [
+    (0.9, 0.7, 0.2),   # gold
+    (0.2, 0.9, 0.7),   # teal
+    (0.8, 0.3, 0.8),   # magenta
+    (0.3, 0.7, 0.9),   # sky blue
+    (0.9, 0.5, 0.3),   # orange
+    (0.5, 0.9, 0.3),   # lime
+]
+
+
+def _face_half_extents(face, normal: Tuple[float, float, float]) -> Tuple[float, float]:
+    """
+    Compute two half-extents (U, V) for a face by projecting its bounding box
+    onto the same tangent vectors that ``quad_vertices`` will use.
+
+    This ensures the U half-extent matches the quad's U direction and
+    the V half-extent matches the quad's V direction.
+
+    Returns:
+        ``(half_u, half_v)`` — half-extents for the quad, with 5 % padding.
+    """
+    try:
+        bb = face.bounding_box()
+        dx = bb.max.X - bb.min.X
+        dy = bb.max.Y - bb.min.Y
+        dz = bb.max.Z - bb.min.Z
+
+        nx, ny, nz = normal
+
+        # ---- Replicate the tangent-vector logic from quad_vertices ----
+        if abs(nx) < 0.9:
+            ref = (1.0, 0.0, 0.0)
+        else:
+            ref = (0.0, 1.0, 0.0)
+
+        # U = normal × ref
+        ux = ny * ref[2] - nz * ref[1]
+        uy = nz * ref[0] - nx * ref[2]
+        uz = nx * ref[1] - ny * ref[0]
+        mag = math.sqrt(ux * ux + uy * uy + uz * uz) or 1.0
+        ux, uy, uz = ux / mag, uy / mag, uz / mag
+
+        # V = normal × U
+        vx = ny * uz - nz * uy
+        vy = nz * ux - nx * uz
+        vz = nx * uy - ny * ux
+
+        # Project bbox extents onto U and V
+        extent_u = abs(dx * ux) + abs(dy * uy) + abs(dz * uz)
+        extent_v = abs(dx * vx) + abs(dy * vy) + abs(dz * vz)
+
+        half_u = extent_u / 2.0 * 1.005
+        half_v = extent_v / 2.0 * 1.005
+
+        # Ensure minimum visible size
+        half_u = max(half_u, 0.1)
+        half_v = max(half_v, 0.1)
+        return (half_u, half_v)
+    except Exception:
+        return (3.0, 3.0)
+
+
+def extract_face_planes(
+    solid,
+    body_name: str = "Body",
+    opacity: float = 0.25,
+) -> List[ConstructionPlane]:
+    """
+    Extract planar faces from a build123d solid and return them as
+    ``ConstructionPlane`` objects suitable for "sketch on face" workflows.
+
+    Only truly planar faces are returned (cylinders, splines etc. are skipped).
+    Each face plane is sized to match the actual face dimensions.
+
+    Args:
+        solid:     A build123d Part/Solid.
+        body_name: Name of the parent body (used in plane naming).
+        opacity:   Display opacity of the face planes.
+
+    Returns:
+        A list of ``ConstructionPlane`` objects, one per planar face.
+    """
+    if solid is None:
+        return []
+
+    try:
+        faces = solid.faces()
+    except Exception as e:
+        print(f"[SparkWorks] Could not enumerate faces: {e}")
+        return []
+
+    planes: List[ConstructionPlane] = []
+    face_idx = 0
+
+    for face in faces:
+        try:
+            # Only keep planar faces
+            # build123d 0.8: geom_type is a property returning a GeomType enum
+            # build123d 0.10+: geom_type() is a method returning a string
+            geom = face.geom_type
+            if callable(geom):
+                geom = geom()
+            geom_str = str(geom).upper()
+            if "PLANE" not in geom_str:
+                continue
+
+            # Get face centre and outward normal
+            centre = face.center()
+            normal_vec = face.normal_at(centre)
+
+            nx, ny, nz = float(normal_vec.X), float(normal_vec.Y), float(normal_vec.Z)
+            # Nudge origin a tiny bit along the normal so the plane
+            # sits just in front of the body face and wins raycasts.
+            FACE_OFFSET = 0.002
+            origin = (
+                float(centre.X) + nx * FACE_OFFSET,
+                float(centre.Y) + ny * FACE_OFFSET,
+                float(centre.Z) + nz * FACE_OFFSET,
+            )
+            normal = (nx, ny, nz)
+
+            # Size the plane quad to match the actual face
+            half_u, half_v = _face_half_extents(face, normal)
+
+            color = _FACE_COLORS[face_idx % len(_FACE_COLORS)]
+
+            plane = ConstructionPlane(
+                name=f"{body_name}_Face{face_idx}",
+                plane_type="CUSTOM",
+                origin=origin,
+                normal=normal,
+                size=half_u,
+                size_v=half_v,
+                color=color,
+                opacity=opacity,
+            )
+            planes.append(plane)
+            face_idx += 1
+
+        except Exception as e:
+            print(f"[SparkWorks] Skipping face: {e}")
+            continue
+
+    return planes
 
 
 # ---------------------------------------------------------------------------

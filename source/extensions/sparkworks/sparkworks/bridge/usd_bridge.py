@@ -213,6 +213,38 @@ class UsdBridge:
             return remainder.split("/")[0]
         return None
 
+    def is_body_prim(self, prim_path: str) -> Optional[str]:
+        """
+        Check whether a USD prim path belongs to a body mesh.
+
+        Returns:
+            The body name (e.g. "Body1") if *prim_path* is under
+            the Bodies scope, otherwise ``None``.
+        """
+        prefix = self.bodies_root + "/"
+        if prim_path.startswith(prefix):
+            remainder = prim_path[len(prefix):]
+            return remainder.split("/")[0]
+        return None
+
+    def remove_face_planes(self):
+        """Remove face-plane visualizations (planes whose name contains '_Face')."""
+        if not USD_AVAILABLE:
+            return
+        stage = self._get_stage()
+        if stage is None:
+            return
+        constr_prim = stage.GetPrimAtPath(self.construction_root)
+        if not constr_prim.IsValid():
+            return
+        to_remove = []
+        for child in constr_prim.GetChildren():
+            name = child.GetName()
+            if "_Face" in name:
+                to_remove.append(child.GetPath().pathString)
+        for path in to_remove:
+            stage.RemovePrim(path)
+
     def _write_plane_mesh(
         self,
         stage,
@@ -524,6 +556,7 @@ class UsdBridge:
             self._set_attr(prim, f"{NS}:symmetric", operation.symmetric, Sdf.ValueTypeNames.Bool)
             self._set_attr(prim, f"{NS}:both", operation.both, Sdf.ValueTypeNames.Bool)
             self._set_attr(prim, f"{NS}:negDistance", operation.neg_distance, Sdf.ValueTypeNames.Double)
+            self._set_attr(prim, f"{NS}:join", operation.join, Sdf.ValueTypeNames.Bool)
 
         elif isinstance(operation, RevolveOperation):
             self._set_attr(prim, f"{NS}:angle", operation.angle, Sdf.ValueTypeNames.Double)
@@ -672,6 +705,7 @@ class UsdBridge:
                 symmetric=self._get_attr(prim, f"{NS}:symmetric") or False,
                 both=self._get_attr(prim, f"{NS}:both") or False,
                 neg_distance=self._get_attr(prim, f"{NS}:negDistance") or 0.0,
+                join=self._get_attr(prim, f"{NS}:join") or False,
             )
         elif op_type == "revolve":
             op = RevolveOperation(

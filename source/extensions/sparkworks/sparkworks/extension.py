@@ -22,7 +22,11 @@ except ImportError:
     notifications = None
 
 from .kernel import Sketch, Tessellator
-from .kernel.construction_plane import ConstructionPlane, create_origin_planes
+from .kernel.construction_plane import (
+    ConstructionPlane,
+    create_origin_planes,
+    extract_face_planes,
+)
 from .kernel.operations import (
     ExtrudeOperation,
     RevolveOperation,
@@ -83,6 +87,11 @@ class ParametricCadExtension(omni.ext.IExt):
         self._feature_counter = 0
         self._body_counter = 0
         self._current_body_name = "Body1"
+
+        # -- Face-on-body state (for "sketch on face" workflow) ----
+        self._face_planes: List[ConstructionPlane] = []   # currently-shown face planes
+        self._face_plane_body: Optional[str] = None       # body name whose faces are shown
+        self._sketch_parent_body: Optional[str] = None    # body to join into on extrude
 
         # -- Sketch tool manager (interactive drawing state machine) ----
         self._sketch_tool = SketchToolManager()
@@ -180,6 +189,9 @@ class ParametricCadExtension(omni.ext.IExt):
         self._construction_planes = []
         self._plane_name_map = {}
         self._selected_plane = None
+        self._face_planes = []
+        self._face_plane_body = None
+        self._sketch_parent_body = None
 
     # ========================================================================
     # Callback Wiring
@@ -331,22 +343,86 @@ class ParametricCadExtension(omni.ext.IExt):
         if not paths:
             return
 
-        # Check if the selected prim is a construction plane
         for path in paths:
+            # 1) Check if the selected prim is a construction plane (or face plane)
             plane_name = self._bridge.is_construction_plane(path)
             if plane_name and plane_name in self._plane_name_map:
                 plane = self._plane_name_map[plane_name]
                 self._on_construction_plane_clicked(plane)
-                # Clear selection so the plane doesn't stay highlighted
-                selection.clear_selected_prim_paths()
-                break
+                return
+
+            # 2) Check if the selected prim is a body mesh
+            body_name = self._bridge.is_body_prim(path)
+            if body_name:
+                self._on_body_clicked(body_name)
+                return
 
     def _on_construction_plane_clicked(self, plane: ConstructionPlane):
         """Select a construction plane (does not create a sketch yet)."""
         self._selected_plane = plane
+        # Track whether this is a face plane (for boolean join on extrude)
+        if "_Face" in plane.name and self._face_plane_body:
+            self._sketch_parent_body = self._face_plane_body
+        else:
+            self._sketch_parent_body = None
         self._toolbar.set_plane_hint(f"Selected: {plane.name} — click Create Sketch")
         self._set_status(f"Plane '{plane.name}' selected — click Create Sketch to begin")
         print(f"[{EXTENSION_NAME}] Plane selected: {plane.name}")
+
+    def _on_body_clicked(self, body_name: str):
+        """
+        Handle a click on a body mesh — show selectable face planes.
+
+        Extracts all planar faces from the build123d solid, creates
+        semi-transparent construction plane quads for each, and registers
+        them so the user can click on one to start a sketch.
+        """
+        solid = self._timeline.current_solid
+        if solid is None:
+            self._set_status(f"Body '{body_name}' has no solid geometry")
+            return
+
+        # Remove any previously shown face planes
+        self._clear_face_planes()
+
+        # Extract planar faces from the build123d solid
+        face_planes = extract_face_planes(solid, body_name=body_name)
+        if not face_planes:
+            self._set_status(f"No planar faces found on '{body_name}'")
+            _notify(f"No planar faces on '{body_name}'.", "warning")
+            return
+
+        # Show face planes as semi-transparent quads in the viewport
+        try:
+            result = self._bridge.create_construction_planes(face_planes)
+            for fp in face_planes:
+                self._plane_name_map[fp.name] = fp
+            self._face_planes = face_planes
+            self._face_plane_body = body_name
+            n = len(face_planes)
+            self._set_status(
+                f"'{body_name}' — {n} face(s) shown. Click a face to select it."
+            )
+            self._toolbar.set_plane_hint(
+                f"{n} faces on {body_name} — click one, then Create Sketch"
+            )
+            print(f"[{EXTENSION_NAME}] Showing {n} face planes for {body_name}")
+        except Exception as e:
+            print(f"[{EXTENSION_NAME}] Failed to create face planes: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _clear_face_planes(self):
+        """Remove face-plane overlays from the viewport and internal maps."""
+        if not self._face_planes:
+            return
+        # Remove from plane_name_map
+        for fp in self._face_planes:
+            self._plane_name_map.pop(fp.name, None)
+        # Remove USD prims
+        self._bridge.remove_face_planes()
+        self._face_planes = []
+        self._face_plane_body = None
 
     def _action_new_sketch_on_plane(self, plane: ConstructionPlane):
         """Create a new sketch on a specific ConstructionPlane."""
@@ -362,6 +438,9 @@ class ParametricCadExtension(omni.ext.IExt):
         self._sketch_tool.deactivate()
         self._toolbar.set_active_tool(None)
         self._update_sketch_view()
+
+        # Clear face-plane overlays now that a face has been chosen
+        self._clear_face_planes()
 
         # Automatically switch to the Sketch View tab
         self._focus_sketch_view()
@@ -570,13 +649,35 @@ class ParametricCadExtension(omni.ext.IExt):
             return
         dist = self._toolbar.extrude_distance
         self._feature_counter += 1
-        self._body_counter += 1
-        op = ExtrudeOperation(distance=dist)
+
+        # Determine if this extrude should fuse with a parent body
+        is_join = self._sketch_parent_body is not None
+        op = ExtrudeOperation(distance=dist, join=is_join)
         op.name = f"Extrude{self._feature_counter}"
-        self._current_body_name = f"Body{self._body_counter}"
-        self._set_status(f"Extruding {dist} units...")
+
+        if is_join:
+            # Sketch-on-face: fuse into the same body, don't increment counter
+            self._current_body_name = self._sketch_parent_body
+            self._set_status(
+                f"Extruding {dist} units (join onto {self._sketch_parent_body})..."
+            )
+        else:
+            # New body
+            self._body_counter += 1
+            self._current_body_name = f"Body{self._body_counter}"
+            self._set_status(f"Extruding {dist} units...")
+
         self._timeline.add_operation(op, name=op.name)
-        self._set_status(f"Extrude (d={dist}) complete — {self._current_body_name} created")
+
+        if is_join:
+            self._set_status(
+                f"Extrude (d={dist}) joined to {self._sketch_parent_body}"
+            )
+            self._sketch_parent_body = None  # reset
+        else:
+            self._set_status(
+                f"Extrude (d={dist}) complete — {self._current_body_name} created"
+            )
 
     def _action_revolve(self):
         if not self._timeline.features:
@@ -629,6 +730,9 @@ class ParametricCadExtension(omni.ext.IExt):
         self._feature_counter = 0
         self._body_counter = 0
         self._current_body_name = "Body1"
+        self._face_planes = []
+        self._face_plane_body = None
+        self._sketch_parent_body = None
         self._sketch_tool.deactivate()
         self._toolbar.set_active_tool(None)
         self._toolbar.set_sketch_mode(False)

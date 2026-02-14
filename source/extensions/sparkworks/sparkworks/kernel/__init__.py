@@ -11,4 +11,4 @@ from .operations import (
     BooleanOperation,
 )
 from .tessellator import Tessellator
-from .construction_plane import ConstructionPlane, create_origin_planes
+from .construction_plane import ConstructionPlane, create_origin_planes, extract_face_planes
