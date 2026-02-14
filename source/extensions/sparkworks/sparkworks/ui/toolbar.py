@@ -1,9 +1,9 @@
 """
-CAD Toolbar — main action bar for the parametric CAD extension.
+CAD Toolbar — main action bar for the SparkWorks extension.
 
 Provides buttons for:
-- New Sketch (with plane selection)
-- Sketch tools with dimension inputs (line, rectangle, circle, arc)
+- New Sketch / Finish Sketch (with plane selection)
+- Drawing tool selection (Line, Rectangle, Circle) — Fusion 360-style
 - 3D operations with parameter inputs (extrude, revolve, fillet, chamfer)
 - Timeline controls (rebuild, clear)
 - Status label showing current state
@@ -62,25 +62,43 @@ TOOLBAR_STYLE = {
 BUTTON_HEIGHT = 28
 FIELD_HEIGHT = 24
 
+# Active tool button style
+ACTIVE_TOOL_STYLE = {
+    "Button": {
+        "background_color": 0xFF1166AA,
+        "border_color": 0xFF33AAFF,
+        "border_width": 2,
+        "border_radius": 4,
+        "margin": 2,
+        "padding": 6,
+    },
+    "Button.Label": {
+        "color": 0xFFFFFFFF,
+        "font_size": 13,
+    },
+}
+
 
 class CadToolbar:
     """
     Dockable toolbar window for CAD operations.
 
-    Includes input fields for primitive dimensions and operation parameters
-    so the user can specify values before adding geometry.
+    The Sketch section provides tool-selection buttons (Line, Rectangle,
+    Circle) rather than dimension input fields.  Drawing happens
+    interactively in the Sketch View.
     """
 
     def __init__(self):
         self._window: Optional[ui.Window] = None
 
-        # Callbacks — set these from the extension
+        # Callbacks — set from the extension
         self.on_new_sketch: Optional[Callable] = None
         self.on_finish_sketch: Optional[Callable] = None
-        self.on_add_line: Optional[Callable] = None
-        self.on_add_rectangle: Optional[Callable] = None
-        self.on_add_circle: Optional[Callable] = None
-        self.on_add_arc: Optional[Callable] = None
+        # Tool selection callbacks (not primitive creation)
+        self.on_tool_line: Optional[Callable] = None
+        self.on_tool_rectangle: Optional[Callable] = None
+        self.on_tool_circle: Optional[Callable] = None
+        # 3D operations
         self.on_extrude: Optional[Callable] = None
         self.on_revolve: Optional[Callable] = None
         self.on_fillet: Optional[Callable] = None
@@ -94,24 +112,16 @@ class CadToolbar:
         self._plane_model = None
         self._status_label = None
 
-        # -- Dimension input models --
-        # Rectangle
-        self._rect_width_model = None
-        self._rect_height_model = None
-        # Circle
-        self._circle_radius_model = None
-        # Line
-        self._line_x1_model = None
-        self._line_y1_model = None
-        self._line_x2_model = None
-        self._line_y2_model = None
-        # Extrude
+        # Tool buttons — stored so we can change their style when active
+        self._btn_line = None
+        self._btn_rect = None
+        self._btn_circle = None
+        self._active_tool_name: Optional[str] = None
+
+        # 3D operation parameter models
         self._extrude_dist_model = None
-        # Revolve
         self._revolve_angle_model = None
-        # Fillet
         self._fillet_radius_model = None
-        # Chamfer
         self._chamfer_length_model = None
 
     @property
@@ -133,7 +143,6 @@ class CadToolbar:
         with self._window.frame:
             with ui.ScrollingFrame():
                 with ui.VStack(spacing=6):
-                    # Status bar at top
                     self._build_status_bar()
                     ui.Line(height=2, style={"color": 0xFF444444})
                     self._build_sketch_section()
@@ -146,7 +155,6 @@ class CadToolbar:
                     ui.Spacer()
 
     def destroy(self):
-        """Clean up the toolbar window."""
         if self._window:
             self._window.destroy()
             self._window = None
@@ -160,10 +168,31 @@ class CadToolbar:
         if self._status_label is not None:
             self._status_label.text = message
 
+    def set_active_tool(self, tool_name: Optional[str]):
+        """
+        Highlight the active drawing tool button.
+
+        Args:
+            tool_name: One of "line", "rectangle", "circle", or None to
+                       deactivate all.
+        """
+        self._active_tool_name = tool_name
+        buttons = {
+            "line": self._btn_line,
+            "rectangle": self._btn_rect,
+            "circle": self._btn_circle,
+        }
+        for name, btn in buttons.items():
+            if btn is None:
+                continue
+            if name == tool_name:
+                btn.set_style(ACTIVE_TOOL_STYLE)
+            else:
+                btn.set_style(TOOLBAR_STYLE)
+
     # -- UI Builders ---------------------------------------------------------
 
     def _build_status_bar(self):
-        """Build a status label at the top."""
         with ui.HStack(height=22):
             self._status_label = ui.Label(
                 "Ready — click New Sketch to begin",
@@ -172,7 +201,7 @@ class CadToolbar:
             )
 
     def _build_sketch_section(self):
-        """Build the sketch tools section with dimension inputs."""
+        """Build the sketch section with tool-selection buttons."""
         with ui.CollapsableFrame("  Sketch", height=0):
             with ui.VStack(spacing=4):
                 # Plane selection
@@ -184,103 +213,111 @@ class CadToolbar:
 
                 # New / Finish sketch
                 with ui.HStack(height=BUTTON_HEIGHT):
-                    ui.Button("New Sketch", width=ui.Fraction(1), clicked_fn=self._on_new_sketch)
-                    ui.Button("Finish Sketch", width=ui.Fraction(1), clicked_fn=self._on_finish_sketch)
+                    ui.Button(
+                        "New Sketch",
+                        width=ui.Fraction(1),
+                        clicked_fn=self._on_new_sketch,
+                    )
+                    ui.Button(
+                        "Finish Sketch",
+                        width=ui.Fraction(1),
+                        clicked_fn=self._on_finish_sketch,
+                    )
 
                 ui.Spacer(height=4)
+                ui.Label(
+                    "Drawing Tools",
+                    style={"font_size": 12, "color": 0xFFCCCCCC},
+                )
 
-                # --- Rectangle ---
-                ui.Label("Rectangle", style={"font_size": 12, "color": 0xFFCCCCCC})
-                with ui.HStack(height=FIELD_HEIGHT):
-                    ui.Label("W:", width=20)
-                    self._rect_width_model = ui.SimpleFloatModel(20.0)
-                    ui.FloatField(model=self._rect_width_model, width=ui.Fraction(1))
-                    ui.Spacer(width=8)
-                    ui.Label("H:", width=20)
-                    self._rect_height_model = ui.SimpleFloatModel(10.0)
-                    ui.FloatField(model=self._rect_height_model, width=ui.Fraction(1))
-                ui.Button("Add Rectangle", height=BUTTON_HEIGHT, clicked_fn=self._on_add_rectangle)
-
-                ui.Spacer(height=4)
-
-                # --- Circle ---
-                ui.Label("Circle", style={"font_size": 12, "color": 0xFFCCCCCC})
-                with ui.HStack(height=FIELD_HEIGHT):
-                    ui.Label("Radius:", width=70)
-                    self._circle_radius_model = ui.SimpleFloatModel(5.0)
-                    ui.FloatField(model=self._circle_radius_model, width=ui.Fraction(1))
-                ui.Button("Add Circle", height=BUTTON_HEIGHT, clicked_fn=self._on_add_circle)
-
-                ui.Spacer(height=4)
-
-                # --- Line ---
-                ui.Label("Line", style={"font_size": 12, "color": 0xFFCCCCCC})
-                with ui.HStack(height=FIELD_HEIGHT):
-                    ui.Label("X1:", width=24)
-                    self._line_x1_model = ui.SimpleFloatModel(0.0)
-                    ui.FloatField(model=self._line_x1_model, width=ui.Fraction(1))
-                    ui.Label("Y1:", width=24)
-                    self._line_y1_model = ui.SimpleFloatModel(0.0)
-                    ui.FloatField(model=self._line_y1_model, width=ui.Fraction(1))
-                with ui.HStack(height=FIELD_HEIGHT):
-                    ui.Label("X2:", width=24)
-                    self._line_x2_model = ui.SimpleFloatModel(10.0)
-                    ui.FloatField(model=self._line_x2_model, width=ui.Fraction(1))
-                    ui.Label("Y2:", width=24)
-                    self._line_y2_model = ui.SimpleFloatModel(0.0)
-                    ui.FloatField(model=self._line_y2_model, width=ui.Fraction(1))
-                ui.Button("Add Line", height=BUTTON_HEIGHT, clicked_fn=self._on_add_line)
+                # Tool-selection buttons
+                with ui.HStack(height=BUTTON_HEIGHT + 4, spacing=4):
+                    self._btn_line = ui.Button(
+                        "Line",
+                        width=ui.Fraction(1),
+                        clicked_fn=self._on_tool_line,
+                    )
+                    self._btn_rect = ui.Button(
+                        "Rectangle",
+                        width=ui.Fraction(1),
+                        clicked_fn=self._on_tool_rectangle,
+                    )
+                    self._btn_circle = ui.Button(
+                        "Circle",
+                        width=ui.Fraction(1),
+                        clicked_fn=self._on_tool_circle,
+                    )
 
     def _build_operations_section(self):
         """Build the 3D operations section with parameter inputs."""
         with ui.CollapsableFrame("  3D Operations", height=0):
             with ui.VStack(spacing=4):
-                # --- Extrude ---
+                # Extrude
                 ui.Label("Extrude", style={"font_size": 12, "color": 0xFFCCCCCC})
                 with ui.HStack(height=FIELD_HEIGHT):
                     ui.Label("Distance:", width=70)
                     self._extrude_dist_model = ui.SimpleFloatModel(10.0)
-                    ui.FloatField(model=self._extrude_dist_model, width=ui.Fraction(1))
-                ui.Button("Extrude", height=BUTTON_HEIGHT, clicked_fn=self._on_extrude)
+                    ui.FloatField(
+                        model=self._extrude_dist_model, width=ui.Fraction(1)
+                    )
+                ui.Button(
+                    "Extrude", height=BUTTON_HEIGHT, clicked_fn=self._on_extrude
+                )
 
                 ui.Spacer(height=4)
 
-                # --- Revolve ---
+                # Revolve
                 ui.Label("Revolve", style={"font_size": 12, "color": 0xFFCCCCCC})
                 with ui.HStack(height=FIELD_HEIGHT):
                     ui.Label("Angle:", width=70)
                     self._revolve_angle_model = ui.SimpleFloatModel(360.0)
-                    ui.FloatField(model=self._revolve_angle_model, width=ui.Fraction(1))
-                ui.Button("Revolve", height=BUTTON_HEIGHT, clicked_fn=self._on_revolve)
+                    ui.FloatField(
+                        model=self._revolve_angle_model, width=ui.Fraction(1)
+                    )
+                ui.Button(
+                    "Revolve", height=BUTTON_HEIGHT, clicked_fn=self._on_revolve
+                )
 
     def _build_modifiers_section(self):
-        """Build the modifier operations section with parameter inputs."""
         with ui.CollapsableFrame("  Modifiers", height=0):
             with ui.VStack(spacing=4):
-                # --- Fillet ---
+                # Fillet
                 ui.Label("Fillet", style={"font_size": 12, "color": 0xFFCCCCCC})
                 with ui.HStack(height=FIELD_HEIGHT):
                     ui.Label("Radius:", width=70)
                     self._fillet_radius_model = ui.SimpleFloatModel(1.0)
-                    ui.FloatField(model=self._fillet_radius_model, width=ui.Fraction(1))
-                ui.Button("Apply Fillet", height=BUTTON_HEIGHT, clicked_fn=self._on_fillet)
+                    ui.FloatField(
+                        model=self._fillet_radius_model, width=ui.Fraction(1)
+                    )
+                ui.Button(
+                    "Apply Fillet", height=BUTTON_HEIGHT, clicked_fn=self._on_fillet
+                )
 
                 ui.Spacer(height=4)
 
-                # --- Chamfer ---
+                # Chamfer
                 ui.Label("Chamfer", style={"font_size": 12, "color": 0xFFCCCCCC})
                 with ui.HStack(height=FIELD_HEIGHT):
                     ui.Label("Length:", width=70)
                     self._chamfer_length_model = ui.SimpleFloatModel(1.0)
-                    ui.FloatField(model=self._chamfer_length_model, width=ui.Fraction(1))
-                ui.Button("Apply Chamfer", height=BUTTON_HEIGHT, clicked_fn=self._on_chamfer)
+                    ui.FloatField(
+                        model=self._chamfer_length_model, width=ui.Fraction(1)
+                    )
+                ui.Button(
+                    "Apply Chamfer",
+                    height=BUTTON_HEIGHT,
+                    clicked_fn=self._on_chamfer,
+                )
 
     def _build_timeline_controls(self):
-        """Build timeline control buttons."""
         with ui.CollapsableFrame("  Controls", height=0):
             with ui.VStack(spacing=4):
                 with ui.HStack(height=BUTTON_HEIGHT):
-                    ui.Button("Rebuild All", width=ui.Fraction(1), clicked_fn=self._on_rebuild_all)
+                    ui.Button(
+                        "Rebuild All",
+                        width=ui.Fraction(1),
+                        clicked_fn=self._on_rebuild_all,
+                    )
                     ui.Button(
                         "Clear All",
                         width=ui.Fraction(1),
@@ -288,7 +325,7 @@ class CadToolbar:
                         style={"Button": {"background_color": 0xFF552222}},
                     )
 
-    # -- Value getters -------------------------------------------------------
+    # -- Value getters (3D operations only) -----------------------------------
 
     @property
     def selected_plane(self) -> str:
@@ -297,30 +334,6 @@ class CadToolbar:
             planes = ["XY", "XZ", "YZ"]
             return planes[idx] if idx < len(planes) else "XY"
         return "XY"
-
-    @property
-    def rect_width(self) -> float:
-        return self._rect_width_model.as_float if self._rect_width_model else 20.0
-
-    @property
-    def rect_height(self) -> float:
-        return self._rect_height_model.as_float if self._rect_height_model else 10.0
-
-    @property
-    def circle_radius(self) -> float:
-        return self._circle_radius_model.as_float if self._circle_radius_model else 5.0
-
-    @property
-    def line_start(self):
-        x = self._line_x1_model.as_float if self._line_x1_model else 0.0
-        y = self._line_y1_model.as_float if self._line_y1_model else 0.0
-        return (x, y)
-
-    @property
-    def line_end(self):
-        x = self._line_x2_model.as_float if self._line_x2_model else 10.0
-        y = self._line_y2_model.as_float if self._line_y2_model else 0.0
-        return (x, y)
 
     @property
     def extrude_distance(self) -> float:
@@ -348,21 +361,17 @@ class CadToolbar:
         if self.on_finish_sketch:
             self.on_finish_sketch()
 
-    def _on_add_line(self):
-        if self.on_add_line:
-            self.on_add_line()
+    def _on_tool_line(self):
+        if self.on_tool_line:
+            self.on_tool_line()
 
-    def _on_add_rectangle(self):
-        if self.on_add_rectangle:
-            self.on_add_rectangle()
+    def _on_tool_rectangle(self):
+        if self.on_tool_rectangle:
+            self.on_tool_rectangle()
 
-    def _on_add_circle(self):
-        if self.on_add_circle:
-            self.on_add_circle()
-
-    def _on_add_arc(self):
-        if self.on_add_arc:
-            self.on_add_arc()
+    def _on_tool_circle(self):
+        if self.on_tool_circle:
+            self.on_tool_circle()
 
     def _on_extrude(self):
         if self.on_extrude:

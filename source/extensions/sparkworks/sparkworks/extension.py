@@ -30,9 +30,15 @@ from .kernel.operations import (
 from .timeline import Timeline, Feature, FeatureType
 from .bridge import UsdBridge
 from .ui import CadToolbar, TimelinePanel, PropertyPanel, SketchViewport
+from .ui.sketch_tool import SketchToolManager, SketchToolMode
 
 
 EXTENSION_NAME = "sparkworks"
+
+# Key codes from carb.input.KeyboardInput (used by omni.ui set_key_pressed_fn)
+KEY_ENTER = 51          # carb.input.KeyboardInput.ENTER
+KEY_NUMPAD_ENTER = 95   # carb.input.KeyboardInput.NUMPAD_ENTER
+KEY_ESCAPE = 49         # carb.input.KeyboardInput.ESCAPE
 
 
 def _notify(message: str, status="info"):
@@ -40,16 +46,20 @@ def _notify(message: str, status="info"):
     if notifications is not None:
         try:
             if status == "warning":
-                notifications.post_notification(message, status=notifications.NotificationStatus.WARNING)
+                notifications.post_notification(
+                    message, status=notifications.NotificationStatus.WARNING
+                )
             else:
-                notifications.post_notification(message, status=notifications.NotificationStatus.INFO)
+                notifications.post_notification(
+                    message, status=notifications.NotificationStatus.INFO
+                )
         except Exception:
             pass
     print(f"[{EXTENSION_NAME}] {message}")
 
 
 class ParametricCadExtension(omni.ext.IExt):
-    """Main Parametric CAD extension class."""
+    """Main SparkWorks extension class."""
 
     def on_startup(self, ext_id: str):
         print(f"[{EXTENSION_NAME}] Extension startup")
@@ -64,6 +74,9 @@ class ParametricCadExtension(omni.ext.IExt):
         self._active_sketch: Optional[Sketch] = None
         self._sketch_counter = 0
         self._feature_counter = 0
+
+        # -- Sketch tool manager (interactive drawing state machine) ----
+        self._sketch_tool = SketchToolManager()
 
         # -- UI ----
         self._toolbar = CadToolbar()
@@ -81,15 +94,16 @@ class ParametricCadExtension(omni.ext.IExt):
         self._connect_timeline_panel_callbacks()
         self._connect_property_panel_callbacks()
         self._connect_timeline_callbacks()
+        self._connect_sketch_tool_callbacks()
+        self._connect_viewport_callbacks()
 
         # -- Dock windows after the UI settles ----
         asyncio.ensure_future(self._dock_windows())
 
-        _notify("Parametric CAD ready. Click 'New Sketch' to begin.")
+        _notify("SparkWorks ready. Click 'New Sketch' to begin.")
 
     async def _dock_windows(self):
         """Dock our windows relative to the Viewport after it exists."""
-        # Wait for the Viewport window to be ready
         viewport_win = None
         for _ in range(60):
             await omni.kit.app.get_app().next_update_async()
@@ -101,33 +115,32 @@ class ParametricCadExtension(omni.ext.IExt):
             print(f"[{EXTENSION_NAME}] Viewport window not found, skipping dock")
             return
 
-        # Wait a few more frames for layout to settle
         for _ in range(5):
             await omni.kit.app.get_app().next_update_async()
 
         try:
-            # Dock toolbar to the LEFT of the Viewport
             if self._toolbar.window:
-                self._toolbar.window.dock_in(viewport_win, ui.DockPosition.LEFT, ratio=0.18)
-
-            # Wait a frame between docks to let layout update
+                self._toolbar.window.dock_in(
+                    viewport_win, ui.DockPosition.LEFT, ratio=0.18
+                )
             await omni.kit.app.get_app().next_update_async()
 
-            # Dock properties to the RIGHT of the Viewport
             if self._property_panel.window:
-                self._property_panel.window.dock_in(viewport_win, ui.DockPosition.RIGHT, ratio=0.18)
-
+                self._property_panel.window.dock_in(
+                    viewport_win, ui.DockPosition.RIGHT, ratio=0.18
+                )
             await omni.kit.app.get_app().next_update_async()
 
-            # Dock timeline to the BOTTOM of the Viewport
             if self._timeline_panel.window:
-                self._timeline_panel.window.dock_in(viewport_win, ui.DockPosition.BOTTOM, ratio=0.18)
-
+                self._timeline_panel.window.dock_in(
+                    viewport_win, ui.DockPosition.BOTTOM, ratio=0.18
+                )
             await omni.kit.app.get_app().next_update_async()
 
-            # Dock sketch view as a tab next to the Viewport (center area)
             if self._sketch_viewport.window:
-                self._sketch_viewport.window.dock_in(viewport_win, ui.DockPosition.SAME)
+                self._sketch_viewport.window.dock_in(
+                    viewport_win, ui.DockPosition.SAME
+                )
 
             print(f"[{EXTENSION_NAME}] Windows docked successfully")
         except Exception as e:
@@ -146,6 +159,7 @@ class ParametricCadExtension(omni.ext.IExt):
         self._timeline = None
         self._bridge = None
         self._active_sketch = None
+        self._sketch_tool = None
 
     # ========================================================================
     # Callback Wiring
@@ -155,10 +169,11 @@ class ParametricCadExtension(omni.ext.IExt):
         tb = self._toolbar
         tb.on_new_sketch = self._action_new_sketch
         tb.on_finish_sketch = self._action_finish_sketch
-        tb.on_add_line = self._action_add_line
-        tb.on_add_rectangle = self._action_add_rectangle
-        tb.on_add_circle = self._action_add_circle
-        tb.on_add_arc = self._action_add_arc
+        # Tool selection (not primitive creation)
+        tb.on_tool_line = self._action_tool_line
+        tb.on_tool_rectangle = self._action_tool_rectangle
+        tb.on_tool_circle = self._action_tool_circle
+        # 3D operations
         tb.on_extrude = self._action_extrude
         tb.on_revolve = self._action_revolve
         tb.on_fillet = self._action_fillet
@@ -175,10 +190,26 @@ class ParametricCadExtension(omni.ext.IExt):
 
     def _connect_property_panel_callbacks(self):
         self._property_panel.on_param_changed = self._action_update_param
+        self._property_panel.on_primitive_edited = self._on_primitive_edited
 
     def _connect_timeline_callbacks(self):
         self._timeline.on_rebuild = self._on_timeline_rebuild
         self._timeline.on_feature_changed = self._on_features_changed
+
+    def _connect_sketch_tool_callbacks(self):
+        """Wire the sketch tool state machine to the extension."""
+        st = self._sketch_tool
+        st.on_primitive_created = self._on_tool_primitive_created
+        st.on_status_changed = self._set_status
+        st.on_preview_changed = self._on_tool_preview_changed
+        st.on_chain_cancelled = self._on_tool_chain_cancelled
+
+    def _connect_viewport_callbacks(self):
+        """Wire the sketch viewport mouse/key events to the tool manager."""
+        sv = self._sketch_viewport
+        sv.on_viewport_click = self._on_viewport_click
+        sv.on_viewport_move = self._on_viewport_move
+        sv.on_viewport_key = self._on_viewport_key
 
     def _set_status(self, msg: str):
         self._toolbar.set_status(msg)
@@ -197,6 +228,88 @@ class ParametricCadExtension(omni.ext.IExt):
             self._sketch_viewport.clear_info()
 
     # ========================================================================
+    # Viewport Events (mouse / keyboard)
+    # ========================================================================
+
+    def _on_viewport_click(self, world_x: float, world_y: float, button: int):
+        """Handle a click in the sketch viewport."""
+        if self._active_sketch is None:
+            return
+
+        if button == 0:  # Left click — draw
+            self._sketch_tool.on_click(world_x, world_y)
+        elif button == 1:  # Right click — finish chain
+            self._sketch_tool.on_finish()
+
+    def _on_viewport_move(self, world_x: float, world_y: float):
+        """Handle mouse movement in the sketch viewport."""
+        if self._active_sketch is None:
+            return
+        self._sketch_tool.on_mouse_move(world_x, world_y)
+
+    def _on_viewport_key(self, key: int, pressed: bool):
+        """Handle a key press in the sketch viewport."""
+        if not pressed:
+            return
+        if key in (KEY_ENTER, KEY_NUMPAD_ENTER):
+            self._sketch_tool.on_finish()
+        elif key == KEY_ESCAPE:
+            self._sketch_tool.cancel()
+            self._toolbar.set_active_tool(None)
+
+    # ========================================================================
+    # Sketch Tool Events
+    # ========================================================================
+
+    def _on_tool_primitive_created(self, primitive):
+        """Called when the sketch tool completes a primitive (e.g. a line segment)."""
+        if self._active_sketch is None:
+            return
+
+        from .kernel.sketch import SketchLine
+
+        if isinstance(primitive, SketchLine):
+            self._active_sketch.add_line(
+                start=primitive.start, end=primitive.end
+            )
+
+        prim_idx = len(self._active_sketch.primitives) - 1
+        self._update_sketch_view()
+
+        # Show the new primitive's properties in the panel
+        if self._active_sketch.primitives:
+            last_prim = self._active_sketch.primitives[-1]
+            self._property_panel.show_sketch_primitive(last_prim, prim_idx)
+
+    def _on_tool_preview_changed(self):
+        """Called when the rubber-band preview or placed-points change."""
+        preview = self._sketch_tool.preview_line
+        if preview:
+            from_pt, to_pt = preview
+            self._sketch_viewport.set_placed_points(self._sketch_tool.points)
+            self._sketch_viewport.set_preview_line(from_pt, to_pt)
+        else:
+            self._sketch_viewport.set_placed_points(self._sketch_tool.points)
+            self._sketch_viewport.set_preview_line(None, None)
+
+    def _on_tool_chain_cancelled(self, count: int):
+        """
+        Called when the user presses Escape — remove the last *count*
+        primitives that were created during this chain.
+        """
+        if self._active_sketch is None or count <= 0:
+            return
+        prims = self._active_sketch.primitives
+        for _ in range(min(count, len(prims))):
+            prims.pop()
+        self._update_sketch_view()
+        self._property_panel._show_no_selection()
+
+    def _on_primitive_edited(self, primitive, index: int):
+        """Called when the user edits a primitive's properties in the panel."""
+        self._update_sketch_view()
+
+    # ========================================================================
     # Toolbar Actions
     # ========================================================================
 
@@ -205,8 +318,10 @@ class ParametricCadExtension(omni.ext.IExt):
         name = f"Sketch{self._sketch_counter}"
         self._active_sketch = Sketch(name=name, plane_name=plane_name)
         self._toolbar.set_sketch_mode(True)
+        self._sketch_tool.deactivate()
+        self._toolbar.set_active_tool(None)
         self._update_sketch_view()
-        self._set_status(f"Sketching '{name}' on {plane_name} — add primitives, then Finish")
+        self._set_status(f"Sketching '{name}' on {plane_name} — select a drawing tool")
         _notify(f"New sketch '{name}' on {plane_name} plane.")
 
     def _action_finish_sketch(self):
@@ -215,7 +330,7 @@ class ParametricCadExtension(omni.ext.IExt):
             _notify("No active sketch to finish.", "warning")
             return
         if not self._active_sketch.primitives:
-            self._set_status("Sketch is empty — add a primitive first")
+            self._set_status("Sketch is empty — draw something first")
             _notify("Sketch is empty.", "warning")
             return
 
@@ -226,54 +341,40 @@ class ParametricCadExtension(omni.ext.IExt):
         _notify(f"Sketch '{name}' added with {count} primitives.")
         self._active_sketch = None
         self._toolbar.set_sketch_mode(False)
+        self._sketch_tool.deactivate()
+        self._toolbar.set_active_tool(None)
+        self._sketch_viewport.clear_preview()
         self._update_sketch_view()
 
-    def _action_add_line(self):
+    # -- Tool activation (interactive drawing) --------------------------------
+
+    def _action_tool_line(self):
         if self._active_sketch is None:
             self._set_status("Start a New Sketch first")
             _notify("Start a sketch first.", "warning")
             return
-        start = self._toolbar.line_start
-        end = self._toolbar.line_end
-        self._active_sketch.add_line(start=start, end=end)
-        n = len(self._active_sketch.primitives)
-        self._set_status(f"Line added — {n} primitives in sketch")
-        self._update_sketch_view()
+        self._sketch_tool.activate_tool(SketchToolMode.LINE)
+        self._toolbar.set_active_tool("line")
 
-    def _action_add_rectangle(self):
+    def _action_tool_rectangle(self):
         if self._active_sketch is None:
             self._set_status("Start a New Sketch first")
             _notify("Start a sketch first.", "warning")
             return
-        w = self._toolbar.rect_width
-        h = self._toolbar.rect_height
-        self._active_sketch.add_rectangle(width=w, height=h)
-        n = len(self._active_sketch.primitives)
-        self._set_status(f"Rectangle {w}x{h} added — {n} primitives in sketch")
-        self._update_sketch_view()
+        self._sketch_tool.activate_tool(SketchToolMode.RECTANGLE)
+        self._toolbar.set_active_tool("rectangle")
+        self._set_status("Rectangle tool — not yet implemented (coming soon)")
 
-    def _action_add_circle(self):
+    def _action_tool_circle(self):
         if self._active_sketch is None:
             self._set_status("Start a New Sketch first")
             _notify("Start a sketch first.", "warning")
             return
-        r = self._toolbar.circle_radius
-        self._active_sketch.add_circle(radius=r)
-        n = len(self._active_sketch.primitives)
-        self._set_status(f"Circle r={r} added — {n} primitives in sketch")
-        self._update_sketch_view()
+        self._sketch_tool.activate_tool(SketchToolMode.CIRCLE)
+        self._toolbar.set_active_tool("circle")
+        self._set_status("Circle tool — not yet implemented (coming soon)")
 
-    def _action_add_arc(self):
-        if self._active_sketch is None:
-            self._set_status("Start a New Sketch first")
-            _notify("Start a sketch first.", "warning")
-            return
-        self._active_sketch.add_arc(
-            start=(0.0, 0.0), mid=(5.0, 5.0), end=(10.0, 0.0)
-        )
-        n = len(self._active_sketch.primitives)
-        self._set_status(f"Arc added — {n} primitives in sketch")
-        self._update_sketch_view()
+    # -- 3D operations --------------------------------------------------------
 
     def _action_extrude(self):
         if not self._timeline.features:
@@ -298,7 +399,7 @@ class ParametricCadExtension(omni.ext.IExt):
         op = RevolveOperation(angle=angle, axis_name="Z")
         op.name = f"Revolve{self._feature_counter}"
         self._timeline.add_operation(op, name=op.name)
-        self._set_status(f"Revolve ({angle}°) complete")
+        self._set_status(f"Revolve ({angle}) complete")
 
     def _action_fillet(self):
         if self._timeline.current_solid is None:
@@ -336,8 +437,12 @@ class ParametricCadExtension(omni.ext.IExt):
         self._active_sketch = None
         self._sketch_counter = 0
         self._feature_counter = 0
+        self._sketch_tool.deactivate()
+        self._toolbar.set_active_tool(None)
+        self._toolbar.set_sketch_mode(False)
         self._timeline_panel.update_features([], -1)
         self._property_panel._show_no_selection()
+        self._sketch_viewport.clear_preview()
         self._update_sketch_view()
         self._set_status("Cleared — click New Sketch to begin")
 
@@ -350,7 +455,9 @@ class ParametricCadExtension(omni.ext.IExt):
         features = self._timeline.features
         if 0 <= index < len(features):
             self._property_panel.show_feature(features[index], index)
-            self._set_status(f"Viewing feature #{index + 1}: {features[index].name}")
+            self._set_status(
+                f"Viewing feature #{index + 1}: {features[index].name}"
+            )
 
     def _action_scrub_to_end(self):
         self._timeline.scrub_to_end()
@@ -373,7 +480,7 @@ class ParametricCadExtension(omni.ext.IExt):
         self._set_status(f"Updated {param_name}={value}, rebuilding...")
 
     # ========================================================================
-    # Timeline Events → Bridge + UI Updates
+    # Timeline Events -> Bridge + UI Updates
     # ========================================================================
 
     def _on_timeline_rebuild(self, solid):
@@ -381,7 +488,8 @@ class ParametricCadExtension(omni.ext.IExt):
         if prim_path:
             print(f"[{EXTENSION_NAME}] Mesh updated at {prim_path}")
         self._timeline_panel.update_features(
-            self._timeline.features, self._timeline.scrub_index,
+            self._timeline.features,
+            self._timeline.scrub_index,
         )
 
     def _on_features_changed(self, features):

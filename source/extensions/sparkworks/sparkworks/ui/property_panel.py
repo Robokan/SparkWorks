@@ -45,6 +45,7 @@ class PropertyPanel:
 
         # Callbacks
         self.on_param_changed: Optional[Callable] = None
+        self.on_primitive_edited: Optional[Callable] = None  # (primitive, index)
 
     @property
     def window(self):
@@ -116,6 +117,126 @@ class PropertyPanel:
                     style={"color": 0xFF888888},
                 )
                 ui.Spacer()
+
+    def show_sketch_primitive(self, primitive, index: int):
+        """
+        Display editable properties for a single sketch primitive.
+
+        For a SketchLine this shows start (X, Y) and end (X, Y) with
+        editable float fields.
+        """
+        if ui is None or self._window is None:
+            return
+
+        from ..kernel.sketch import SketchLine, SketchRect, SketchCircle
+
+        self._param_models.clear()
+
+        with self._window.frame:
+            with ui.ScrollingFrame():
+                with ui.VStack(spacing=6):
+                    ui.Label(
+                        f"Primitive #{index + 1}: {primitive.kind.name.title()}",
+                        style={"font_size": 16, "color": 0xFFFFFFFF},
+                        height=24,
+                    )
+                    ui.Spacer(height=4)
+
+                    if isinstance(primitive, SketchLine):
+                        self._build_line_primitive_props(primitive, index)
+                    elif isinstance(primitive, SketchRect):
+                        self._build_rect_primitive_props(primitive, index)
+                    elif isinstance(primitive, SketchCircle):
+                        self._build_circle_primitive_props(primitive, index)
+                    else:
+                        ui.Label("No editable properties for this type.")
+
+                    ui.Spacer()
+
+    def _build_line_primitive_props(self, line, index: int):
+        """Build editable fields for a SketchLine."""
+        ui.Label("Start Point", style={"font_size": 13, "color": 0xFFAADDFF})
+        with ui.HStack(height=24):
+            ui.Label("X:", width=30)
+            m_sx = ui.SimpleFloatModel(line.start[0])
+            ui.FloatField(model=m_sx, width=ui.Fraction(1))
+            ui.Spacer(width=8)
+            ui.Label("Y:", width=30)
+            m_sy = ui.SimpleFloatModel(line.start[1])
+            ui.FloatField(model=m_sy, width=ui.Fraction(1))
+
+        ui.Spacer(height=4)
+        ui.Label("End Point", style={"font_size": 13, "color": 0xFFAADDFF})
+        with ui.HStack(height=24):
+            ui.Label("X:", width=30)
+            m_ex = ui.SimpleFloatModel(line.end[0])
+            ui.FloatField(model=m_ex, width=ui.Fraction(1))
+            ui.Spacer(width=8)
+            ui.Label("Y:", width=30)
+            m_ey = ui.SimpleFloatModel(line.end[1])
+            ui.FloatField(model=m_ey, width=ui.Fraction(1))
+
+        # Length (read-only)
+        dx = line.end[0] - line.start[0]
+        dy = line.end[1] - line.start[1]
+        length = (dx * dx + dy * dy) ** 0.5
+        ui.Spacer(height=4)
+        with ui.HStack(height=24):
+            ui.Label("Length:", width=60)
+            ui.Label(f"{length:.2f}", style={"color": 0xFF88CCFF})
+
+        # Wire up value-changed callbacks
+        def _on_start_x_changed(m, prim=line, idx=index):
+            prim.start = (m.as_float, prim.start[1])
+            if self.on_primitive_edited:
+                self.on_primitive_edited(prim, idx)
+
+        def _on_start_y_changed(m, prim=line, idx=index):
+            prim.start = (prim.start[0], m.as_float)
+            if self.on_primitive_edited:
+                self.on_primitive_edited(prim, idx)
+
+        def _on_end_x_changed(m, prim=line, idx=index):
+            prim.end = (m.as_float, prim.end[1])
+            if self.on_primitive_edited:
+                self.on_primitive_edited(prim, idx)
+
+        def _on_end_y_changed(m, prim=line, idx=index):
+            prim.end = (prim.end[0], m.as_float)
+            if self.on_primitive_edited:
+                self.on_primitive_edited(prim, idx)
+
+        m_sx.add_value_changed_fn(_on_start_x_changed)
+        m_sy.add_value_changed_fn(_on_start_y_changed)
+        m_ex.add_value_changed_fn(_on_end_x_changed)
+        m_ey.add_value_changed_fn(_on_end_y_changed)
+
+    def _build_rect_primitive_props(self, rect, index: int):
+        """Build editable fields for a SketchRect."""
+        with ui.HStack(height=24):
+            ui.Label("Width:", width=60)
+            ui.Label(f"{rect.width:.2f}", style={"color": 0xFF88CCFF})
+        with ui.HStack(height=24):
+            ui.Label("Height:", width=60)
+            ui.Label(f"{rect.height:.2f}", style={"color": 0xFF88CCFF})
+        with ui.HStack(height=24):
+            ui.Label("Center:", width=60)
+            ui.Label(
+                f"({rect.center[0]:.2f}, {rect.center[1]:.2f})",
+                style={"color": 0xFF88CCFF},
+            )
+
+    def _build_circle_primitive_props(self, circle, index: int):
+        """Build editable fields for a SketchCircle."""
+        with ui.HStack(height=24):
+            ui.Label("Radius:", width=60)
+            ui.Label(f"{circle.radius:.2f}", style={"color": 0xFF88CCFF})
+        with ui.HStack(height=24):
+            ui.Label("Center:", width=60)
+            ui.Label(
+                f"({circle.center[0]:.2f}, {circle.center[1]:.2f})",
+                style={"color": 0xFF88CCFF},
+            )
 
     # -- Property builders ---------------------------------------------------
 
