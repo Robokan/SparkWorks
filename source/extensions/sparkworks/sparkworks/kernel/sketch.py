@@ -155,13 +155,23 @@ class Sketch:
 
     Collects primitives and can build them into a build123d Face that serves
     as the profile for 3D operations.
+
+    The sketch can be placed on a named standard plane ("XY", "XZ", "YZ") or
+    on a ``ConstructionPlane`` object for offset / rotated planes.
     """
     name: str = "Sketch"
     plane_name: str = "XY"
     primitives: List = field(default_factory=list)
+    # Optional reference to a ConstructionPlane (set when created via viewport click)
+    construction_plane: Optional[object] = field(default=None, repr=False)
 
     @property
     def plane(self) -> Plane:
+        if self.construction_plane is not None:
+            try:
+                return self.construction_plane.to_build123d_plane()
+            except Exception:
+                pass
         return plane_from_str(self.plane_name)
 
     # -- Adding primitives ---------------------------------------------------

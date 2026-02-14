@@ -92,8 +92,9 @@ class CadToolbar:
         self._window: Optional[ui.Window] = None
 
         # Callbacks — set from the extension
-        self.on_new_sketch: Optional[Callable] = None
+        self.on_create_sketch: Optional[Callable] = None
         self.on_finish_sketch: Optional[Callable] = None
+        self.on_add_plane: Optional[Callable] = None
         # Tool selection callbacks (not primitive creation)
         self.on_tool_line: Optional[Callable] = None
         self.on_tool_rectangle: Optional[Callable] = None
@@ -109,8 +110,9 @@ class CadToolbar:
 
         # State
         self._sketch_mode = False
-        self._plane_model = None
         self._status_label = None
+        self._plane_hint_label = None
+        self._btn_sketch_action = None  # "Create Sketch" / "Finish Sketch" button
 
         # Tool buttons — stored so we can change their style when active
         self._btn_line = None
@@ -162,6 +164,8 @@ class CadToolbar:
     def set_sketch_mode(self, active: bool):
         """Update UI to reflect sketch mode state."""
         self._sketch_mode = active
+        if self._btn_sketch_action is not None:
+            self._btn_sketch_action.text = "Finish Sketch" if active else "Create Sketch"
 
     def set_status(self, message: str):
         """Update the status label text."""
@@ -195,34 +199,39 @@ class CadToolbar:
     def _build_status_bar(self):
         with ui.HStack(height=22):
             self._status_label = ui.Label(
-                "Ready — click New Sketch to begin",
+                "Ready — select a plane, then click Create Sketch",
                 style={"color": 0xFF88BBEE, "font_size": 12},
                 word_wrap=True,
             )
 
     def _build_sketch_section(self):
-        """Build the sketch section with tool-selection buttons."""
+        """Build the sketch section with plane instructions and tool buttons."""
         with ui.CollapsableFrame("  Sketch", height=0):
             with ui.VStack(spacing=4):
-                # Plane selection
-                with ui.HStack(height=FIELD_HEIGHT):
-                    ui.Label("Plane:", width=70)
-                    self._plane_model = ui.ComboBox(
-                        0, "XY", "XZ", "YZ", width=ui.Fraction(1)
+                # Plane selection hint
+                self._plane_hint_label = ui.Label(
+                    "Click a plane in the viewport to start a sketch",
+                    style={"font_size": 11, "color": 0xFF88BBEE},
+                    word_wrap=True,
+                    height=28,
+                )
+
+                # Create / Finish sketch button — toggles based on sketch state
+                with ui.HStack(height=BUTTON_HEIGHT):
+                    self._btn_sketch_action = ui.Button(
+                        "Create Sketch",
+                        width=ui.Fraction(1),
+                        clicked_fn=self._on_sketch_action,
                     )
 
-                # New / Finish sketch
-                with ui.HStack(height=BUTTON_HEIGHT):
-                    ui.Button(
-                        "New Sketch",
-                        width=ui.Fraction(1),
-                        clicked_fn=self._on_new_sketch,
-                    )
-                    ui.Button(
-                        "Finish Sketch",
-                        width=ui.Fraction(1),
-                        clicked_fn=self._on_finish_sketch,
-                    )
+                ui.Spacer(height=4)
+
+                # Add custom plane
+                ui.Button(
+                    "Add Offset Plane...",
+                    height=BUTTON_HEIGHT,
+                    clicked_fn=self._on_add_plane,
+                )
 
                 ui.Spacer(height=4)
                 ui.Label(
@@ -325,15 +334,12 @@ class CadToolbar:
                         style={"Button": {"background_color": 0xFF552222}},
                     )
 
-    # -- Value getters (3D operations only) -----------------------------------
+    def set_plane_hint(self, text: str):
+        """Update the hint label in the Sketch section."""
+        if self._plane_hint_label is not None:
+            self._plane_hint_label.text = text
 
-    @property
-    def selected_plane(self) -> str:
-        if self._plane_model is not None:
-            idx = self._plane_model.model.get_item_value_model().as_int
-            planes = ["XY", "XZ", "YZ"]
-            return planes[idx] if idx < len(planes) else "XY"
-        return "XY"
+    # -- Value getters (3D operations only) -----------------------------------
 
     @property
     def extrude_distance(self) -> float:
@@ -353,9 +359,17 @@ class CadToolbar:
 
     # -- Callback wrappers ---------------------------------------------------
 
-    def _on_new_sketch(self):
-        if self.on_new_sketch:
-            self.on_new_sketch(self.selected_plane)
+    def _on_sketch_action(self):
+        if self._sketch_mode:
+            if self.on_finish_sketch:
+                self.on_finish_sketch()
+        else:
+            if self.on_create_sketch:
+                self.on_create_sketch()
+
+    def _on_add_plane(self):
+        if self.on_add_plane:
+            self.on_add_plane()
 
     def _on_finish_sketch(self):
         if self.on_finish_sketch:

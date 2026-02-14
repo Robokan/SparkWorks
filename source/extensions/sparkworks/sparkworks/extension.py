@@ -8,12 +8,13 @@ into a cohesive CAD modeling experience inside Isaac Sim.
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
+from typing import Dict, List, Optional
 
 import omni.ext
 import omni.kit.app
 import omni.kit.commands
 import omni.ui as ui
+import omni.usd
 
 try:
     import omni.kit.notification_manager as notifications
@@ -21,6 +22,7 @@ except ImportError:
     notifications = None
 
 from .kernel import Sketch, Tessellator
+from .kernel.construction_plane import ConstructionPlane, create_origin_planes
 from .kernel.operations import (
     ExtrudeOperation,
     RevolveOperation,
@@ -70,6 +72,11 @@ class ParametricCadExtension(omni.ext.IExt):
         self._bridge = UsdBridge()
         self._tessellator = Tessellator()
 
+        # -- Construction planes ----
+        self._construction_planes: List[ConstructionPlane] = create_origin_planes()
+        self._plane_name_map: Dict[str, ConstructionPlane] = {}
+        self._selected_plane: Optional[ConstructionPlane] = None
+
         # -- Active sketch state ----
         self._active_sketch: Optional[Sketch] = None
         self._sketch_counter = 0
@@ -77,6 +84,9 @@ class ParametricCadExtension(omni.ext.IExt):
 
         # -- Sketch tool manager (interactive drawing state machine) ----
         self._sketch_tool = SketchToolManager()
+
+        # -- USD selection subscription ----
+        self._selection_sub = None
 
         # -- UI ----
         self._toolbar = CadToolbar()
@@ -96,11 +106,15 @@ class ParametricCadExtension(omni.ext.IExt):
         self._connect_timeline_callbacks()
         self._connect_sketch_tool_callbacks()
         self._connect_viewport_callbacks()
+        self._subscribe_selection_changed()
+
+        # -- Create origin planes in the viewport after stage is ready ----
+        asyncio.ensure_future(self._create_initial_planes())
 
         # -- Dock windows after the UI settles ----
         asyncio.ensure_future(self._dock_windows())
 
-        _notify("SparkWorks ready. Click 'New Sketch' to begin.")
+        _notify("SparkWorks ready. Select a plane, then click Create Sketch.")
 
     async def _dock_windows(self):
         """Dock our windows relative to the Viewport after it exists."""
@@ -148,6 +162,7 @@ class ParametricCadExtension(omni.ext.IExt):
 
     def on_shutdown(self):
         print(f"[{EXTENSION_NAME}] Extension shutdown")
+        self._selection_sub = None
         if self._toolbar:
             self._toolbar.destroy()
         if self._timeline_panel:
@@ -160,6 +175,9 @@ class ParametricCadExtension(omni.ext.IExt):
         self._bridge = None
         self._active_sketch = None
         self._sketch_tool = None
+        self._construction_planes = []
+        self._plane_name_map = {}
+        self._selected_plane = None
 
     # ========================================================================
     # Callback Wiring
@@ -167,8 +185,9 @@ class ParametricCadExtension(omni.ext.IExt):
 
     def _connect_toolbar_callbacks(self):
         tb = self._toolbar
-        tb.on_new_sketch = self._action_new_sketch
+        tb.on_create_sketch = self._action_create_sketch
         tb.on_finish_sketch = self._action_finish_sketch
+        tb.on_add_plane = self._action_add_plane
         # Tool selection (not primitive creation)
         tb.on_tool_line = self._action_tool_line
         tb.on_tool_rectangle = self._action_tool_rectangle
@@ -226,6 +245,109 @@ class ParametricCadExtension(omni.ext.IExt):
         else:
             self._sketch_viewport.update_primitives([])
             self._sketch_viewport.clear_info()
+
+    def _focus_sketch_view(self):
+        """Bring the Sketch View tab to the front."""
+        try:
+            sketch_win = self._sketch_viewport.window
+            if sketch_win is not None:
+                sketch_win.focus()
+        except Exception as e:
+            print(f"[{EXTENSION_NAME}] Could not focus Sketch View: {e}")
+
+    def _focus_viewport(self):
+        """Bring the 3D Viewport tab to the front."""
+        try:
+            viewport_win = ui.Workspace.get_window("Viewport")
+            if viewport_win is not None:
+                viewport_win.focus()
+        except Exception as e:
+            print(f"[{EXTENSION_NAME}] Could not focus Viewport: {e}")
+
+    # ========================================================================
+    # Construction Planes & Selection
+    # ========================================================================
+
+    async def _create_initial_planes(self):
+        """Wait for the stage, then create the three origin construction planes."""
+        # Give the stage a few frames to be ready
+        for _ in range(30):
+            await omni.kit.app.get_app().next_update_async()
+
+        try:
+            result = self._bridge.create_construction_planes(self._construction_planes)
+            self._plane_name_map = {
+                p.name: p for p in self._construction_planes
+            }
+            print(f"[{EXTENSION_NAME}] Origin planes created: {list(result.keys())}")
+        except Exception as e:
+            print(f"[{EXTENSION_NAME}] Failed to create origin planes: {e}")
+
+    def _subscribe_selection_changed(self):
+        """Subscribe to USD selection changes to detect plane clicks."""
+        try:
+            usd_context = omni.usd.get_context()
+            events = usd_context.get_stage_event_stream()
+            self._selection_sub = events.create_subscription_to_pop(
+                self._on_stage_event,
+                name=f"{EXTENSION_NAME}_selection",
+            )
+        except Exception as e:
+            print(f"[{EXTENSION_NAME}] Could not subscribe to selection events: {e}")
+
+    def _on_stage_event(self, event):
+        """Handle USD stage events — we only care about selection changes."""
+        if event.type != int(omni.usd.StageEventType.SELECTION_CHANGED):
+            return
+
+        usd_context = omni.usd.get_context()
+        selection = usd_context.get_selection()
+        paths = selection.get_selected_prim_paths()
+
+        if not paths:
+            return
+
+        # Check if the selected prim is a construction plane
+        for path in paths:
+            plane_name = self._bridge.is_construction_plane(path)
+            if plane_name and plane_name in self._plane_name_map:
+                plane = self._plane_name_map[plane_name]
+                self._on_construction_plane_clicked(plane)
+                # Clear selection so the plane doesn't stay highlighted
+                selection.clear_selected_prim_paths()
+                break
+
+    def _on_construction_plane_clicked(self, plane: ConstructionPlane):
+        """Select a construction plane (does not create a sketch yet)."""
+        self._selected_plane = plane
+        self._toolbar.set_plane_hint(f"Selected: {plane.name} — click Create Sketch")
+        self._set_status(f"Plane '{plane.name}' selected — click Create Sketch to begin")
+        print(f"[{EXTENSION_NAME}] Plane selected: {plane.name}")
+
+    def _action_new_sketch_on_plane(self, plane: ConstructionPlane):
+        """Create a new sketch on a specific ConstructionPlane."""
+        self._sketch_counter += 1
+        name = f"Sketch{self._sketch_counter}"
+        self._active_sketch = Sketch(
+            name=name,
+            plane_name=plane.plane_type,
+            construction_plane=plane,
+        )
+        self._toolbar.set_sketch_mode(True)
+        self._toolbar.set_plane_hint(f"Sketching on {plane.name}")
+        self._sketch_tool.deactivate()
+        self._toolbar.set_active_tool(None)
+        self._update_sketch_view()
+
+        # Automatically switch to the Sketch View tab
+        self._focus_sketch_view()
+
+        self._set_status(f"Sketching '{name}' on {plane.name} — select a drawing tool")
+        _notify(f"New sketch '{name}' on {plane.name}.")
+
+    def _action_add_plane(self):
+        """Stub for adding a custom offset/rotated plane (future feature)."""
+        _notify("Custom plane creation coming soon.", "info")
 
     # ========================================================================
     # Viewport Events (mouse / keyboard)
@@ -313,11 +435,23 @@ class ParametricCadExtension(omni.ext.IExt):
     # Toolbar Actions
     # ========================================================================
 
+    def _action_create_sketch(self):
+        """Handle the 'Create Sketch' button — create sketch on the selected plane."""
+        if self._selected_plane is None:
+            self._set_status("Select a construction plane in the viewport first")
+            _notify("Click a plane in the viewport first.", "warning")
+            self._focus_viewport()
+            return
+
+        self._action_new_sketch_on_plane(self._selected_plane)
+
     def _action_new_sketch(self, plane_name: str = "XY"):
+        """Legacy sketch creation from plane name string (fallback)."""
         self._sketch_counter += 1
         name = f"Sketch{self._sketch_counter}"
         self._active_sketch = Sketch(name=name, plane_name=plane_name)
         self._toolbar.set_sketch_mode(True)
+        self._toolbar.set_plane_hint(f"Sketching on {plane_name}")
         self._sketch_tool.deactivate()
         self._toolbar.set_active_tool(None)
         self._update_sketch_view()
@@ -336,30 +470,39 @@ class ParametricCadExtension(omni.ext.IExt):
 
         count = len(self._active_sketch.primitives)
         name = self._active_sketch.name
-        self._timeline.add_sketch(self._active_sketch)
-        self._set_status(f"'{name}' added ({count} primitives) — ready for operations")
-        _notify(f"Sketch '{name}' added with {count} primitives.")
+
+        try:
+            self._timeline.add_sketch(self._active_sketch)
+            self._set_status(f"'{name}' added ({count} primitives) — ready for operations")
+            _notify(f"Sketch '{name}' added with {count} primitives.")
+        except Exception as e:
+            print(f"[{EXTENSION_NAME}] Error adding sketch to timeline: {e}")
+            self._set_status(f"'{name}' saved ({count} primitives)")
+
+        # Always reset state — button label, viewport, tools
         self._active_sketch = None
-        self._toolbar.set_sketch_mode(False)
         self._sketch_tool.deactivate()
         self._toolbar.set_active_tool(None)
         self._sketch_viewport.clear_preview()
         self._update_sketch_view()
+        self._toolbar.set_sketch_mode(False)
+        self._toolbar.set_plane_hint("Click a plane in the viewport to start a sketch")
+        self._focus_viewport()
 
     # -- Tool activation (interactive drawing) --------------------------------
 
     def _action_tool_line(self):
         if self._active_sketch is None:
-            self._set_status("Start a New Sketch first")
-            _notify("Start a sketch first.", "warning")
+            self._set_status("Click a construction plane first to start a sketch")
+            _notify("Click a plane first.", "warning")
             return
         self._sketch_tool.activate_tool(SketchToolMode.LINE)
         self._toolbar.set_active_tool("line")
 
     def _action_tool_rectangle(self):
         if self._active_sketch is None:
-            self._set_status("Start a New Sketch first")
-            _notify("Start a sketch first.", "warning")
+            self._set_status("Click a construction plane first to start a sketch")
+            _notify("Click a plane first.", "warning")
             return
         self._sketch_tool.activate_tool(SketchToolMode.RECTANGLE)
         self._toolbar.set_active_tool("rectangle")
@@ -367,8 +510,8 @@ class ParametricCadExtension(omni.ext.IExt):
 
     def _action_tool_circle(self):
         if self._active_sketch is None:
-            self._set_status("Start a New Sketch first")
-            _notify("Start a sketch first.", "warning")
+            self._set_status("Click a construction plane first to start a sketch")
+            _notify("Click a plane first.", "warning")
             return
         self._sketch_tool.activate_tool(SketchToolMode.CIRCLE)
         self._toolbar.set_active_tool("circle")
@@ -435,16 +578,22 @@ class ParametricCadExtension(omni.ext.IExt):
         self._connect_timeline_callbacks()
         self._bridge.clear()
         self._active_sketch = None
+        self._selected_plane = None
         self._sketch_counter = 0
         self._feature_counter = 0
         self._sketch_tool.deactivate()
         self._toolbar.set_active_tool(None)
         self._toolbar.set_sketch_mode(False)
+        self._toolbar.set_plane_hint("Click a plane in the viewport to start a sketch")
         self._timeline_panel.update_features([], -1)
         self._property_panel._show_no_selection()
         self._sketch_viewport.clear_preview()
         self._update_sketch_view()
-        self._set_status("Cleared — click New Sketch to begin")
+        self._set_status("Cleared — click a construction plane to begin")
+
+        # Re-create the origin planes
+        self._construction_planes = create_origin_planes()
+        asyncio.ensure_future(self._create_initial_planes())
 
     # ========================================================================
     # Timeline Panel Actions
