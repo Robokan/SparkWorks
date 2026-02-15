@@ -3,8 +3,8 @@ Timeline Panel — displays the parametric feature history.
 
 A dockable panel at the bottom of the viewport that shows each feature as
 a clickable node in a horizontal strip.  A **playback marker** (vertical
-line with a ball handle on top) sits between features and controls the
-scrub position.  The marker is independent of feature selection:
+blue bar) sits between features and controls the scrub position.  The
+marker is independent of feature selection:
 
 - **Click a feature** → selects it (shows properties), does NOT move marker.
 - **Click between features** → moves the marker there (rebuilds geometry).
@@ -14,6 +14,7 @@ scrub position.  The marker is independent of feature selection:
 
 from __future__ import annotations
 
+import os
 from typing import Callable, List, Optional
 
 try:
@@ -22,54 +23,88 @@ except ImportError:
     ui = None
 
 
+# ── Icon paths (FreeCAD-sourced SVGs) ───────────────────────────────────────
+
+_ICONS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "icons")
+
+FEATURE_ICON_FILES = {
+    "SKETCH":             os.path.join(_ICONS_DIR, "toolbar_create_sketch.svg"),
+    "EXTRUDE":            os.path.join(_ICONS_DIR, "toolbar_extrude.svg"),
+    "REVOLVE":            os.path.join(_ICONS_DIR, "toolbar_revolve.svg"),
+    "FILLET":             os.path.join(_ICONS_DIR, "toolbar_fillet.svg"),
+    "CHAMFER":            os.path.join(_ICONS_DIR, "toolbar_chamfer.svg"),
+    "BOOLEAN_JOIN":       os.path.join(_ICONS_DIR, "boolean_join.svg"),
+    "BOOLEAN_CUT":        os.path.join(_ICONS_DIR, "boolean_cut.svg"),
+    "BOOLEAN_INTERSECT":  os.path.join(_ICONS_DIR, "boolean_intersect.svg"),
+}
+
 # ── Colours ─────────────────────────────────────────────────────────────────
 
-MARKER_COLOR = 0xFF44AAFF          # bright blue marker line + ball
-SLOT_BG = 0xFF222222               # slot background (subtle)
-SLOT_BG_HOVER = 0xFF333333         # slot on hover
+MARKER_COLOR = 0xFF44AAFF          # bright blue marker
+SLOT_BG_HOVER = 0xFF444444         # slot on hover
 SELECTED_BORDER = 0xFFFF8800       # orange border for selected feature
-ACTIVE_BG = 0xFF1A3355             # feature before/at the marker
-INACTIVE_BG = 0xFF2A2A2A           # feature after the marker
-SUPPRESSED_BG = 0xFF1A1A1A
-SUPPRESSED_FG = 0xFF666666
-ACTIVE_FG = 0xFFCCCCCC
-INACTIVE_FG = 0xFF888888
+ACTIVE_BG = 0xFFBBBBBB             # light gray for features before/at marker
+INACTIVE_BG = 0xFF888888           # dimmed gray for features after marker
+SUPPRESSED_BG = 0xFF555555         # dark gray for suppressed
 
 # ── Dimensions ──────────────────────────────────────────────────────────────
 
-SLOT_W = 18              # width of a clickable marker slot
-FEATURE_W = 96           # width of a feature button
-FEATURE_H = 56           # height of a feature button
-BALL_R = 6               # radius of the marker ball
-MARKER_LINE_W = 3        # width of the marker vertical line
+SLOT_W = 6               # width of a clickable marker slot
+ICON_SIZE = 20           # icon height/width
+FEATURE_W = 28           # box around icon
+FEATURE_H = 28
 
-# ── Feature icons ───────────────────────────────────────────────────────────
-
-FEATURE_ICONS = {
-    "SKETCH": "[S]",
-    "EXTRUDE": "[E]",
-    "REVOLVE": "[R]",
-    "FILLET": "[F]",
-    "CHAMFER": "[C]",
-    "BOOLEAN_JOIN": "[+]",
-    "BOOLEAN_CUT": "[-]",
-    "BOOLEAN_INTERSECT": "[&]",
-}
+# ── Shared styles (NO Button overrides — those are set per-widget) ──────────
 
 TIMELINE_STYLE = {
     "Label": {"font_size": 13},
+}
+
+# Reusable per-widget style dicts ────────────────────────────────────────────
+
+_HEADER_BTN = {
     "Button": {
         "background_color": 0xFF2A2A2A,
         "border_color": 0xFF444444,
         "border_width": 1,
         "border_radius": 3,
-        "padding": 4,
+        "padding": 2,
         "margin": 1,
     },
-    "Button:hovered": {
-        "background_color": 0xFF3A3A3A,
-    },
+    "Button:hovered": {"background_color": 0xFF3A3A3A},
+    "Button.Label": {"font_size": 12},
 }
+
+
+def _slot_rect_style(active: bool):
+    """Style dict for a marker-slot Rectangle."""
+    return {
+        "background_color": MARKER_COLOR if active else 0x00000000,
+        "border_width": 0,
+        "border_radius": 1 if active else 0,
+    }
+
+
+def _feature_style(bg, border_color, border_width):
+    return {
+        "Button": {
+            "background_color": bg,
+            "border_color": border_color,
+            "border_width": border_width,
+            "border_radius": 3,
+            "padding": 0,
+            "margin": 0,
+        },
+        "Button:hovered": {
+            "background_color": bg,
+            "border_color": MARKER_COLOR,
+            "border_width": 2,
+            "padding": 0,
+            "margin": 0,
+        },
+        "Button.Label": {"font_size": 1, "color": 0x00000000},
+        "Button.Image": {"image_url": ""},
+    }
 
 
 class TimelinePanel:
@@ -160,7 +195,7 @@ class TimelinePanel:
     def _build_full(self):
         n = len(self._features)
         with ui.VStack(spacing=0):
-            # Header
+            # Header row
             with ui.HStack(height=24):
                 ui.Label("Feature Timeline",
                          style={"font_size": 14, "color": 0xFFCCCCCC})
@@ -168,11 +203,11 @@ class TimelinePanel:
                 ui.Button("|<", width=28, height=22,
                           clicked_fn=self._go_to_start,
                           tooltip="Go to beginning",
-                          style={"Button.Label": {"font_size": 12}})
+                          style=_HEADER_BTN)
                 ui.Button(">|", width=28, height=22,
                           clicked_fn=self._go_to_end,
                           tooltip="Go to end",
-                          style={"Button.Label": {"font_size": 12}})
+                          style=_HEADER_BTN)
 
             ui.Spacer(height=4)
 
@@ -182,82 +217,26 @@ class TimelinePanel:
                 vertical_scrollbar_policy=ui.ScrollBarPolicy.SCROLLBAR_ALWAYS_OFF,
                 height=FEATURE_H + 8,
             ):
-                with ui.HStack(spacing=0, height=FEATURE_H + 4):
-                    # [slot -1] [feature 0] [slot 0] [feature 1] [slot 1] ...
+                with ui.HStack(spacing=0, height=FEATURE_H):
+                    # Layout: [slot -1] [feat 0] [slot 0] [feat 1] [slot 1] …
                     self._build_slot(-1)
                     for i in range(n):
                         self._build_feature_node(i, self._features[i])
                         self._build_slot(i)
-                    ui.Spacer(width=10)
+                    ui.Spacer(width=4)
 
-    # ── Marker slot (clickable gap between features) ────────────────────────
+    # ── Marker slot ─────────────────────────────────────────────────────────
 
     def _build_slot(self, position: int):
-        """
-        A thin clickable column between features.  The active slot shows
-        a blue ball + line; inactive slots show a subtle button.
-        """
+        """Thin clickable column between features. Active slot = blue bar."""
         is_active = (position == self._marker_pos)
-
-        if is_active:
-            # Active marker: blue ball on top, line below
-            with ui.VStack(width=SLOT_W, height=FEATURE_H + 4, spacing=0):
-                # Ball row
-                ui.Button(
-                    "●",
-                    width=SLOT_W,
-                    height=BALL_R * 2 + 4,
-                    clicked_fn=lambda pos=position: self._on_slot_clicked(pos),
-                    style={
-                        "Button": {
-                            "background_color": 0x00000000,
-                            "border_width": 0,
-                            "padding": 0,
-                            "margin": 0,
-                        },
-                        "Button.Label": {
-                            "color": MARKER_COLOR,
-                            "font_size": 16,
-                        },
-                    },
-                    tooltip="Marker position",
-                )
-                # Line below
-                with ui.HStack():
-                    ui.Spacer()
-                    ui.Rectangle(
-                        width=MARKER_LINE_W,
-                        style={
-                            "background_color": MARKER_COLOR,
-                            "border_radius": 1,
-                        },
-                    )
-                    ui.Spacer()
-        else:
-            # Inactive slot: subtle clickable button
-            ui.Button(
-                "·",
-                width=SLOT_W,
-                height=FEATURE_H + 4,
-                clicked_fn=lambda pos=position: self._on_slot_clicked(pos),
-                style={
-                    "Button": {
-                        "background_color": SLOT_BG,
-                        "border_width": 0,
-                        "border_radius": 2,
-                        "padding": 0,
-                        "margin": 1,
-                    },
-                    "Button:hovered": {
-                        "background_color": SLOT_BG_HOVER,
-                    },
-                    "Button.Label": {
-                        "color": 0xFF555555,
-                        "font_size": 14,
-                    },
-                },
-                tooltip="Click to move marker here",
-            )
+        rect = ui.Rectangle(
+            width=SLOT_W, height=FEATURE_H,
+            style=_slot_rect_style(is_active),
+        )
+        rect.set_mouse_released_fn(
+            lambda x, y, btn, m, p=position: self._on_slot_clicked(p) if btn == 0 else None
+        )
 
     # ── Feature node ────────────────────────────────────────────────────────
 
@@ -266,34 +245,33 @@ class TimelinePanel:
         is_before_marker = (index <= self._marker_pos)
 
         if feature.suppressed:
-            bg, fg = SUPPRESSED_BG, SUPPRESSED_FG
+            bg = SUPPRESSED_BG
         elif is_before_marker:
-            bg, fg = ACTIVE_BG, ACTIVE_FG
+            bg = ACTIVE_BG
         else:
-            bg, fg = INACTIVE_BG, INACTIVE_FG
+            bg = INACTIVE_BG
 
-        border_color = SELECTED_BORDER if is_selected else 0xFF444444
-        border_width = 2 if is_selected else 1
+        border_color = SELECTED_BORDER if is_selected else 0xFFAAAAAA
+        border_w = 2 if is_selected else 1
 
         icon_key = "SKETCH"
         if feature.is_operation and feature.operation:
             icon_key = feature.operation.op_type.name
-        icon = FEATURE_ICONS.get(icon_key, "[?]")
+        icon_path = FEATURE_ICON_FILES.get(icon_key)
+
+        style = _feature_style(bg, border_color, border_w)
+
+        # If we have a valid icon, set it via Button.Image style
+        if icon_path and os.path.isfile(icon_path):
+            style["Button.Image"] = {"image_url": icon_path}
 
         btn = ui.Button(
-            f"{icon}\n{feature.name}",
-            width=FEATURE_W,
-            height=FEATURE_H,
+            "",
+            width=FEATURE_W, height=FEATURE_H,
+            image_width=ICON_SIZE, image_height=ICON_SIZE,
             clicked_fn=lambda idx=index: self._on_feature_click(idx),
-            style={
-                "Button": {
-                    "background_color": bg,
-                    "border_color": border_color,
-                    "border_width": border_width,
-                    "border_radius": 4,
-                },
-                "Button.Label": {"color": fg, "font_size": 11},
-            },
+            tooltip=feature.name,
+            style=style,
         )
         btn.set_mouse_pressed_fn(
             lambda x, y, b, m, idx=index, sup=feature.suppressed:

@@ -16,6 +16,7 @@ repository = ""
 "omni.usd" = {}
 "omni.kit.commands" = {}
 "omni.kit.notification_manager" = {}
+"omni.kit.widget.toolbar" = {}
 
 [settings]
 exts."sparkworks".default_tessellation_tolerance = 0.001

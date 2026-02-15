@@ -652,6 +652,27 @@ class UsdBridge:
             if parent_prim.IsValid() and not list(parent_prim.GetChildren()):
                 stage.RemovePrim(parent_path)
 
+    def remove_all_profile_overlays(self):
+        """
+        Remove every ``Profiles`` child under every sketch feature in the
+        timeline.  This guarantees no stale profile meshes remain visible
+        after a marker move / scrub.
+        """
+        if not USD_AVAILABLE:
+            return
+        stage = self._get_stage()
+        if stage is None:
+            return
+        tl_path = self.timeline_root
+        tl_prim = stage.GetPrimAtPath(tl_path)
+        if not tl_prim.IsValid():
+            return
+        for child in tl_prim.GetChildren():
+            profiles_path = f"{child.GetPath()}/{self.PROFILES_CHILD}"
+            profiles_prim = stage.GetPrimAtPath(profiles_path)
+            if profiles_prim.IsValid():
+                stage.RemovePrim(profiles_path)
+
     def is_profile_prim(self, prim_path: str) -> Optional[str]:
         """
         Check if a prim path belongs to a profile overlay.

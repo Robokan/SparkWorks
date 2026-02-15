@@ -120,13 +120,13 @@ class ParametricCadExtension(omni.ext.IExt):
         self._property_panel = PropertyPanel()
         self._sketch_viewport = SketchViewport()
 
+        # -- Wire toolbar callbacks BEFORE build (needed for native toolbar) --
+        self._connect_toolbar_callbacks()
         self._toolbar.build()
+
         self._timeline_panel.build()
         self._property_panel.build()
         self._sketch_viewport.build()
-
-        # -- Wire callbacks ----
-        self._connect_toolbar_callbacks()
         self._connect_timeline_panel_callbacks()
         self._connect_property_panel_callbacks()
         self._connect_timeline_callbacks()
@@ -159,11 +159,7 @@ class ParametricCadExtension(omni.ext.IExt):
             await omni.kit.app.get_app().next_update_async()
 
         try:
-            if self._toolbar.window:
-                self._toolbar.window.dock_in(
-                    viewport_win, ui.DockPosition.LEFT, ratio=0.18
-                )
-            await omni.kit.app.get_app().next_update_async()
+            # Toolbar is now native (omni.kit.widget.toolbar), no docking needed
 
             if self._property_panel.window:
                 self._property_panel.window.dock_in(
@@ -272,6 +268,11 @@ class ParametricCadExtension(omni.ext.IExt):
 
     def _set_status(self, msg: str):
         self._toolbar.set_status(msg)
+
+    def _set_profile_selection(self, indices: set):
+        """Update selected profile indices and sync toolbar visibility."""
+        self._selected_profile_indices = indices
+        self._toolbar.set_profiles_selected(bool(indices))
 
     def _update_sketch_view(self):
         """Push the current active sketch's primitives to the sketch viewport."""
@@ -489,7 +490,7 @@ class ParametricCadExtension(omni.ext.IExt):
                     pass
 
         if selected_profile_indices:
-            self._selected_profile_indices = set(selected_profile_indices)
+            self._set_profile_selection(set(selected_profile_indices))
             sel = sorted(self._selected_profile_indices)
             label = ", ".join(str(s) for s in sel)
             self._set_status(f"Profile(s) {label} selected — click Extrude")
@@ -558,7 +559,7 @@ class ParametricCadExtension(omni.ext.IExt):
         self._sketch_parent_body = None
         self._profile_paths = []
         self._profile_faces = []
-        self._selected_profile_indices = set()
+        self._set_profile_selection(set())
         self._profile_sketch_name = None
         self._profile_feature_index = 0
         self._profile_plane_normal = None
@@ -741,15 +742,17 @@ class ParametricCadExtension(omni.ext.IExt):
             feature_index=self._profile_feature_index,
             plane_normal=self._profile_plane_normal,
         )
-        self._selected_profile_indices = set(selected_indices) if selected_indices else set()
+        self._set_profile_selection(set(selected_indices) if selected_indices else set())
 
     def _clear_profile_overlays(self):
         """Remove all profile overlay meshes from the viewport."""
         if self._profile_paths:
             self._bridge.remove_profile_overlays(self._profile_paths)
+        # Also wipe any lingering profile prims from other sketches
+        self._bridge.remove_all_profile_overlays()
         self._profile_paths = []
         self._profile_faces = []
-        self._selected_profile_indices = set()
+        self._set_profile_selection(set())
         self._profile_sketch_name = None
         self._profile_feature_index = 0
         self._profile_plane_normal = None
@@ -779,7 +782,7 @@ class ParametricCadExtension(omni.ext.IExt):
 
         faces = sketch.build_all_faces()
         if not faces:
-            self._selected_profile_indices = set()
+            self._set_profile_selection(set())
             return
 
         plane_normal = None
@@ -802,9 +805,9 @@ class ParametricCadExtension(omni.ext.IExt):
         )
         count = len(self._profile_paths)
         if count > 0:
-            self._selected_profile_indices = {0}
+            self._set_profile_selection({0})
         else:
-            self._selected_profile_indices = set()
+            self._set_profile_selection(set())
         print(f"[{EXTENSION_NAME}] Refreshed {count} profile overlays for '{sketch.name}'")
 
     def _create_profile_overlays(self, sketch: Sketch):
@@ -847,7 +850,7 @@ class ParametricCadExtension(omni.ext.IExt):
         n = len(self._profile_paths)
         if n > 0:
             # Auto-select the first (and often only) profile
-            self._selected_profile_indices = {0}
+            self._set_profile_selection({0})
             self._set_status(
                 f"{n} profile(s) detected in '{sketch.name}' — "
                 f"click one then Extrude, or Extrude directly"
@@ -1068,6 +1071,9 @@ class ParametricCadExtension(omni.ext.IExt):
         viewport.  If so, use it immediately.  Otherwise enter picking
         mode so the user can click one.
         """
+        # Clear any lingering profile overlays from a previous sketch
+        self._clear_profile_overlays()
+
         # Check if a construction plane is actively selected right now
         currently_selected = self._get_currently_selected_plane()
         if currently_selected is not None:
@@ -1397,7 +1403,7 @@ class ParametricCadExtension(omni.ext.IExt):
         self._sketch_parent_body = None
         self._profile_paths = []
         self._profile_faces = []
-        self._selected_profile_indices = set()
+        self._set_profile_selection(set())
         self._profile_sketch_name = None
         self._profile_feature_index = 0
         self._profile_plane_normal = None
@@ -1450,6 +1456,7 @@ class ParametricCadExtension(omni.ext.IExt):
             self._toolbar.set_sketch_mode(False)
             self._sketch_viewport.update_primitives([])
             self._sketch_viewport.clear_info()
+            self._clear_profile_overlays()
 
     def _action_marker_moved(self, position: int):
         """
@@ -1458,10 +1465,14 @@ class ParametricCadExtension(omni.ext.IExt):
         ``position`` is the index of the last *included* feature.
         -1 = before all features (nothing visible).
         """
+        # Moving the marker always clears profile overlays
+        self._clear_profile_overlays()
+
         if position < 0:
             # Before all features — clear geometry
             self._timeline._scrub_index = -1
             self._timeline._current_solid = None
+            self._timeline._bodies = {}
             self._timeline._current_sketch_face = None
             self._timeline._notify_rebuild()
             self._set_status("Marker at beginning — no features active")

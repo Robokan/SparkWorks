@@ -1,105 +1,283 @@
 """
-CAD Toolbar — main action bar for the SparkWorks extension.
+CAD Toolbar — native Omniverse Kit toolbar for the SparkWorks extension.
 
-Provides buttons for:
-- New Sketch / Finish Sketch (with plane selection)
-- Drawing tool selection (Line, Rectangle, Circle) — Fusion 360-style
-- 3D operations with parameter inputs (extrude, revolve, fillet, chamfer)
-- Timeline controls (rebuild, clear)
-- Status label showing current state
+Uses `omni.kit.widget.toolbar.WidgetGroup` to integrate buttons into the
+main viewport toolbar, just like the built-in Select / Move / Rotate tools.
+
+Groups (left to right, separated by small spacers):
+  1. Sketch:    Create/Finish Sketch
+  2. Draw:      Line, Rectangle, Circle
+  3. Modeling:  Extrude, Revolve, Fillet, Chamfer
 """
 
 from __future__ import annotations
 
+import os
 from typing import Callable, Optional
 
 try:
     import omni.ui as ui
+    from omni.kit.widget.toolbar import WidgetGroup, get_instance as get_toolbar
 except ImportError:
     ui = None
+    WidgetGroup = object  # fallback so class definition still parses
+
+    def get_toolbar():          # type: ignore[misc]
+        return None
 
 
-# Style constants
-TOOLBAR_STYLE = {
-    "Button": {
-        "background_color": 0xFF333333,
-        "border_color": 0xFF555555,
-        "border_width": 1,
-        "border_radius": 4,
-        "margin": 2,
-        "padding": 6,
-    },
-    "Button:hovered": {
-        "background_color": 0xFF444444,
-    },
-    "Button:pressed": {
-        "background_color": 0xFF2277CC,
-    },
-    "Button.Label": {
-        "color": 0xFFDDDDDD,
-        "font_size": 13,
-    },
-    "Label": {
-        "color": 0xFFAAAAAA,
-        "font_size": 11,
-    },
-    "ComboBox": {
-        "background_color": 0xFF333333,
-        "color": 0xFFDDDDDD,
-        "font_size": 13,
-        "border_radius": 4,
-    },
-    "FloatField": {
-        "background_color": 0xFF1A1A1A,
-        "border_color": 0xFF555555,
-        "border_width": 1,
-        "border_radius": 3,
-        "color": 0xFFDDDDDD,
-        "font_size": 13,
-    },
+# ── Icon paths ──────────────────────────────────────────────────────────────
+
+_ICONS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "icons")
+
+ICON = {
+    "create_sketch":  os.path.join(_ICONS_DIR, "toolbar_create_sketch.svg"),
+    "finish_sketch":  os.path.join(_ICONS_DIR, "toolbar_finish_sketch.svg"),
+    "line":           os.path.join(_ICONS_DIR, "toolbar_line.svg"),
+    "rectangle":      os.path.join(_ICONS_DIR, "toolbar_rectangle.svg"),
+    "circle":         os.path.join(_ICONS_DIR, "toolbar_circle.svg"),
+    "extrude":        os.path.join(_ICONS_DIR, "toolbar_extrude.svg"),
+    "revolve":        os.path.join(_ICONS_DIR, "toolbar_revolve.svg"),
+    "fillet":         os.path.join(_ICONS_DIR, "toolbar_fillet.svg"),
+    "chamfer":        os.path.join(_ICONS_DIR, "toolbar_chamfer.svg"),
 }
 
-BUTTON_HEIGHT = 28
-FIELD_HEIGHT = 24
 
-# Active tool button style
-ACTIVE_TOOL_STYLE = {
-    "Button": {
-        "background_color": 0xFF1166AA,
-        "border_color": 0xFF33AAFF,
-        "border_width": 2,
-        "border_radius": 4,
-        "margin": 2,
-        "padding": 6,
-    },
-    "Button.Label": {
-        "color": 0xFFFFFFFF,
-        "font_size": 13,
-    },
-}
+# ── WidgetGroup implementation ─────────────────────────────────────────────
 
+class SparkWorksToolbarGroup(WidgetGroup):
+    """
+    A `WidgetGroup` that adds SparkWorks CAD buttons to the native toolbar.
+    """
+
+    def __init__(self, owner: "CadToolbar"):
+        super().__init__()
+        self._owner = owner  # look up callbacks on the facade dynamically
+
+        # State
+        self._sketch_mode = False
+        self._active_tool_name: Optional[str] = None
+
+        # Widget references (set in create())
+        self._btn_sketch: Optional[ui.ToolButton] = None
+        self._btn_line: Optional[ui.ToolButton] = None
+        self._btn_rect: Optional[ui.ToolButton] = None
+        self._btn_circle: Optional[ui.ToolButton] = None
+        self._subs: list = []
+
+        # Visibility groups (populated in create(), hidden by default)
+        self._sketch_tools: list = []   # [gap1, line, rect, circle]
+        self._op_tools: list = []       # [gap2, extrude, revolve, fillet, chamfer]
+
+    # -- WidgetGroup interface ------------------------------------------------
+
+    def get_style(self):
+        """Return name-keyed icon styles consumed by the ToolButtons."""
+        style = {}
+        # Sketch button — toggles between create and finish icons
+        style["Button.Image::sw_sketch"] = {
+            "image_url": ICON["create_sketch"],
+        }
+        style["Button.Image::sw_sketch:checked"] = {
+            "image_url": ICON["finish_sketch"],
+        }
+        # Drawing tools
+        for name in ("line", "rectangle", "circle"):
+            style[f"Button.Image::sw_{name}"] = {"image_url": ICON[name]}
+            style[f"Button.Image::sw_{name}:checked"] = {"image_url": ICON[name]}
+        # 3D operations (non-toggle, so same icon for both states)
+        for name in ("extrude", "revolve", "fillet", "chamfer"):
+            style[f"Button.Image::sw_{name}"] = {"image_url": ICON[name]}
+            style[f"Button.Image::sw_{name}:checked"] = {"image_url": ICON[name]}
+        return style
+
+    def create(self, default_size):
+        """
+        Build the toolbar widgets.  Returns a dict of name → widget so the
+        toolbar can lay them out.
+        """
+        widgets = {}
+        sz = default_size
+
+        # ── Separator before our group ──
+        widgets["sw_sep0"] = ui.Line(
+            width=1, height=sz * 0.6,
+            alignment=ui.Alignment.CENTER,
+            style={"color": 0xFF555555},
+        )
+
+        # ── Sketch button (toggle: create / finish) ──
+        btn = ui.ToolButton(name="sw_sketch", width=sz, height=sz, tooltip="Create Sketch")
+        sub = btn.model.subscribe_value_changed_fn(self._on_sketch_clicked)
+        self._subs.append(sub)
+        self._btn_sketch = btn
+        widgets["sw_sketch"] = btn
+
+        # ── Small gap (sketch tools group) ──
+        gap1 = ui.Spacer(width=6)
+        widgets["sw_gap1"] = gap1
+        self._sketch_tools = [gap1]
+
+        # ── Drawing tools ──
+        for name, tooltip, attr in [
+            ("line",      "Line",      "_btn_line"),
+            ("rectangle", "Rectangle", "_btn_rect"),
+            ("circle",    "Circle",    "_btn_circle"),
+        ]:
+            b = ui.ToolButton(name=f"sw_{name}", width=sz, height=sz, tooltip=tooltip)
+            sub = b.model.subscribe_value_changed_fn(
+                lambda m, n=name: self._on_tool_clicked(n, m)
+            )
+            self._subs.append(sub)
+            setattr(self, attr, b)
+            widgets[f"sw_{name}"] = b
+            self._sketch_tools.append(b)
+
+        # ── Small gap (operation tools group) ──
+        gap2 = ui.Spacer(width=6)
+        widgets["sw_gap2"] = gap2
+        self._op_tools = [gap2]
+
+        # ── 3D operation buttons (fire-and-forget, not toggle) ──
+        for name, tooltip in [
+            ("extrude", "Extrude"),
+            ("revolve", "Revolve"),
+            ("fillet",  "Fillet"),
+            ("chamfer", "Chamfer"),
+        ]:
+            b = ui.ToolButton(name=f"sw_{name}", width=sz, height=sz, tooltip=tooltip)
+            sub = b.model.subscribe_value_changed_fn(
+                lambda m, n=name: self._on_op_clicked(n, m)
+            )
+            self._subs.append(sub)
+            widgets[f"sw_{name}"] = b
+            self._op_tools.append(b)
+
+        # Start with both groups hidden — only "Create Sketch" is visible
+        self.set_sketch_tools_visible(False)
+        self.set_op_tools_visible(False)
+
+        return widgets
+
+    def clean(self):
+        self._subs.clear()
+        self._btn_sketch = None
+        self._btn_line = None
+        self._btn_rect = None
+        self._btn_circle = None
+        self._sketch_tools.clear()
+        self._op_tools.clear()
+        super().clean()
+
+    # -- Visibility control ---------------------------------------------------
+
+    def set_sketch_tools_visible(self, visible: bool):
+        """Show or hide the drawing-tool buttons (Line, Rectangle, Circle)."""
+        for w in self._sketch_tools:
+            if w is not None:
+                w.visible = visible
+
+    def set_op_tools_visible(self, visible: bool):
+        """Show or hide the 3D operation buttons (Extrude, Revolve, etc.)."""
+        for w in self._op_tools:
+            if w is not None:
+                w.visible = visible
+
+    # -- Click handlers -------------------------------------------------------
+
+    def _on_sketch_clicked(self, model):
+        """Toggle between create and finish sketch."""
+        checked = model.get_value_as_bool()
+        o = self._owner
+        if checked:
+            if o.on_create_sketch:
+                o.on_create_sketch()
+        else:
+            if o.on_finish_sketch:
+                o.on_finish_sketch()
+
+    def _on_tool_clicked(self, name: str, model):
+        """Toggle drawing tool.  Un-check others."""
+        checked = model.get_value_as_bool()
+        o = self._owner
+        cb_map = {
+            "line":      o.on_tool_line,
+            "rectangle": o.on_tool_rectangle,
+            "circle":    o.on_tool_circle,
+        }
+        if checked:
+            # Uncheck sibling tools
+            for tool_name, btn in [
+                ("line", self._btn_line),
+                ("rectangle", self._btn_rect),
+                ("circle", self._btn_circle),
+            ]:
+                if tool_name != name and btn is not None:
+                    btn.model.set_value(False)
+            cb = cb_map.get(name)
+            if cb:
+                cb()
+
+    def _on_op_clicked(self, name: str, model):
+        """Fire-and-forget operation button.  Un-check immediately."""
+        if model.get_value_as_bool():
+            model.set_value(False)
+            o = self._owner
+            cb_map = {
+                "extrude": o.on_extrude,
+                "revolve": o.on_revolve,
+                "fillet":  o.on_fillet,
+                "chamfer": o.on_chamfer,
+            }
+            cb = cb_map.get(name)
+            if cb:
+                cb()
+
+    # -- Public state API (called by extension.py) ----------------------------
+
+    def set_sketch_mode(self, active: bool):
+        self._sketch_mode = active
+        if self._btn_sketch is not None:
+            self._btn_sketch.model.set_value(active)
+            self._btn_sketch.tooltip = (
+                "Finish Sketch" if active else "Create Sketch"
+            )
+        # Show drawing tools in sketch mode, hide operations
+        self.set_sketch_tools_visible(active)
+        if active:
+            self.set_op_tools_visible(False)
+
+    def set_active_tool(self, tool_name: Optional[str]):
+        self._active_tool_name = tool_name
+        for name, btn in [
+            ("line", self._btn_line),
+            ("rectangle", self._btn_rect),
+            ("circle", self._btn_circle),
+        ]:
+            if btn is not None:
+                btn.model.set_value(name == tool_name)
+
+
+# ── Facade class (preserves extension.py API) ──────────────────────────────
 
 class CadToolbar:
     """
-    Dockable toolbar window for CAD operations.
-
-    The Sketch section provides tool-selection buttons (Line, Rectangle,
-    Circle) rather than dimension input fields.  Drawing happens
-    interactively in the Sketch View.
+    High-level wrapper that owns a `SparkWorksToolbarGroup` and registers it
+    with the native Omniverse toolbar.  Exposes the same public API that
+    `extension.py` already uses, so no call-site changes are needed.
     """
 
     def __init__(self):
-        self._window: Optional[ui.Window] = None
+        self._group = SparkWorksToolbarGroup(owner=self)
+        self._registered = False
 
-        # Callbacks — set from the extension
+        # Proxy callbacks (extension.py sets these)
         self.on_create_sketch: Optional[Callable] = None
         self.on_finish_sketch: Optional[Callable] = None
         self.on_add_plane: Optional[Callable] = None
-        # Tool selection callbacks (not primitive creation)
         self.on_tool_line: Optional[Callable] = None
         self.on_tool_rectangle: Optional[Callable] = None
         self.on_tool_circle: Optional[Callable] = None
-        # 3D operations
         self.on_extrude: Optional[Callable] = None
         self.on_revolve: Optional[Callable] = None
         self.on_fillet: Optional[Callable] = None
@@ -108,238 +286,63 @@ class CadToolbar:
         self.on_rebuild_all: Optional[Callable] = None
         self.on_clear_all: Optional[Callable] = None
 
-        # State
-        self._sketch_mode = False
-        self._status_label = None
-        self._plane_hint_label = None
-        self._btn_sketch_action = None  # "Create Sketch" / "Finish Sketch" button
+        # Status text (no-op placeholder; the native toolbar doesn't show a
+        # status line — we log to the console and/or notification area instead)
+        self._hint_text = ""
 
-        # Tool buttons — stored so we can change their style when active
-        self._btn_line = None
-        self._btn_rect = None
-        self._btn_circle = None
-        self._active_tool_name: Optional[str] = None
-
-        # 3D operation parameter models
+        # Parameter models (kept so property getters work; not in the toolbar UI)
         self._extrude_dist_model = None
         self._revolve_angle_model = None
         self._fillet_radius_model = None
         self._chamfer_length_model = None
 
+    # -- Compat: window property (returns None — no longer a window) ----------
     @property
     def window(self):
-        return self._window
+        return None
+
+    # -- Build / Destroy ------------------------------------------------------
 
     def build(self):
-        """Build and show the toolbar window."""
-        if ui is None:
+        """Register the widget group with the native toolbar."""
+        toolbar = get_toolbar()
+        if toolbar is None:
+            print("[SparkWorks] omni.kit.widget.toolbar not available — toolbar skipped")
             return
-
-        self._window = ui.Window(
-            "SparkWorks",
-            width=280,
-            height=600,
-        )
-        self._window.frame.set_style(TOOLBAR_STYLE)
-
-        with self._window.frame:
-            with ui.ScrollingFrame():
-                with ui.VStack(spacing=6):
-                    self._build_status_bar()
-                    ui.Line(height=2, style={"color": 0xFF444444})
-                    self._build_sketch_section()
-                    ui.Line(height=2, style={"color": 0xFF444444})
-                    self._build_operations_section()
-                    ui.Line(height=2, style={"color": 0xFF444444})
-                    self._build_modifiers_section()
-                    ui.Line(height=2, style={"color": 0xFF444444})
-                    self._build_timeline_controls()
-                    ui.Spacer()
+        toolbar.add_widget(self._group, priority=200)
+        self._registered = True
 
     def destroy(self):
-        if self._window:
-            self._window.destroy()
-            self._window = None
+        if self._registered:
+            try:
+                toolbar = get_toolbar()
+                if toolbar:
+                    toolbar.remove_widget(self._group)
+            except Exception:
+                pass
+            self._group.clean()
+            self._registered = False
+
+    # -- State API (proxied to the WidgetGroup) --------------------------------
 
     def set_sketch_mode(self, active: bool):
-        """Update UI to reflect sketch mode state."""
-        self._sketch_mode = active
-        if self._btn_sketch_action is not None:
-            self._btn_sketch_action.text = "Finish Sketch" if active else "Create Sketch"
-
-    def set_status(self, message: str):
-        """Update the status label text."""
-        if self._status_label is not None:
-            self._status_label.text = message
+        self._group.set_sketch_mode(active)
 
     def set_active_tool(self, tool_name: Optional[str]):
-        """
-        Highlight the active drawing tool button.
+        self._group.set_active_tool(tool_name)
 
-        Args:
-            tool_name: One of "line", "rectangle", "circle", or None to
-                       deactivate all.
-        """
-        self._active_tool_name = tool_name
-        buttons = {
-            "line": self._btn_line,
-            "rectangle": self._btn_rect,
-            "circle": self._btn_circle,
-        }
-        for name, btn in buttons.items():
-            if btn is None:
-                continue
-            if name == tool_name:
-                btn.set_style(ACTIVE_TOOL_STYLE)
-            else:
-                btn.set_style(TOOLBAR_STYLE)
+    def set_profiles_selected(self, has_profiles: bool):
+        """Show or hide the 3D operation buttons based on profile selection."""
+        self._group.set_op_tools_visible(has_profiles)
 
-    # -- UI Builders ---------------------------------------------------------
-
-    def _build_status_bar(self):
-        with ui.HStack(height=22):
-            self._status_label = ui.Label(
-                "Ready — select a plane, then click Create Sketch",
-                style={"color": 0xFF88BBEE, "font_size": 12},
-                word_wrap=True,
-            )
-
-    def _build_sketch_section(self):
-        """Build the sketch section with plane instructions and tool buttons."""
-        with ui.CollapsableFrame("  Sketch", height=0):
-            with ui.VStack(spacing=4):
-                # Plane selection hint
-                self._plane_hint_label = ui.Label(
-                    "Click a plane in the viewport to start a sketch",
-                    style={"font_size": 11, "color": 0xFF88BBEE},
-                    word_wrap=True,
-                    height=28,
-                )
-
-                # Create / Finish sketch button — toggles based on sketch state
-                with ui.HStack(height=BUTTON_HEIGHT):
-                    self._btn_sketch_action = ui.Button(
-                        "Create Sketch",
-                        width=ui.Fraction(1),
-                        clicked_fn=self._on_sketch_action,
-                    )
-
-                ui.Spacer(height=4)
-
-                # Add custom plane
-                ui.Button(
-                    "Add Offset Plane...",
-                    height=BUTTON_HEIGHT,
-                    clicked_fn=self._on_add_plane,
-                )
-
-                ui.Spacer(height=4)
-                ui.Label(
-                    "Drawing Tools",
-                    style={"font_size": 12, "color": 0xFFCCCCCC},
-                )
-
-                # Tool-selection buttons
-                with ui.HStack(height=BUTTON_HEIGHT + 4, spacing=4):
-                    self._btn_line = ui.Button(
-                        "Line",
-                        width=ui.Fraction(1),
-                        clicked_fn=self._on_tool_line,
-                    )
-                    self._btn_rect = ui.Button(
-                        "Rectangle",
-                        width=ui.Fraction(1),
-                        clicked_fn=self._on_tool_rectangle,
-                    )
-                    self._btn_circle = ui.Button(
-                        "Circle",
-                        width=ui.Fraction(1),
-                        clicked_fn=self._on_tool_circle,
-                    )
-
-    def _build_operations_section(self):
-        """Build the 3D operations section with parameter inputs."""
-        with ui.CollapsableFrame("  3D Operations", height=0):
-            with ui.VStack(spacing=4):
-                # Extrude
-                ui.Label("Extrude", style={"font_size": 12, "color": 0xFFCCCCCC})
-                with ui.HStack(height=FIELD_HEIGHT):
-                    ui.Label("Distance:", width=70)
-                    self._extrude_dist_model = ui.SimpleFloatModel(10.0)
-                    ui.FloatField(
-                        model=self._extrude_dist_model, width=ui.Fraction(1)
-                    )
-                ui.Button(
-                    "Extrude", height=BUTTON_HEIGHT, clicked_fn=self._on_extrude
-                )
-
-                ui.Spacer(height=4)
-
-                # Revolve
-                ui.Label("Revolve", style={"font_size": 12, "color": 0xFFCCCCCC})
-                with ui.HStack(height=FIELD_HEIGHT):
-                    ui.Label("Angle:", width=70)
-                    self._revolve_angle_model = ui.SimpleFloatModel(360.0)
-                    ui.FloatField(
-                        model=self._revolve_angle_model, width=ui.Fraction(1)
-                    )
-                ui.Button(
-                    "Revolve", height=BUTTON_HEIGHT, clicked_fn=self._on_revolve
-                )
-
-    def _build_modifiers_section(self):
-        with ui.CollapsableFrame("  Modifiers", height=0):
-            with ui.VStack(spacing=4):
-                # Fillet
-                ui.Label("Fillet", style={"font_size": 12, "color": 0xFFCCCCCC})
-                with ui.HStack(height=FIELD_HEIGHT):
-                    ui.Label("Radius:", width=70)
-                    self._fillet_radius_model = ui.SimpleFloatModel(1.0)
-                    ui.FloatField(
-                        model=self._fillet_radius_model, width=ui.Fraction(1)
-                    )
-                ui.Button(
-                    "Apply Fillet", height=BUTTON_HEIGHT, clicked_fn=self._on_fillet
-                )
-
-                ui.Spacer(height=4)
-
-                # Chamfer
-                ui.Label("Chamfer", style={"font_size": 12, "color": 0xFFCCCCCC})
-                with ui.HStack(height=FIELD_HEIGHT):
-                    ui.Label("Length:", width=70)
-                    self._chamfer_length_model = ui.SimpleFloatModel(1.0)
-                    ui.FloatField(
-                        model=self._chamfer_length_model, width=ui.Fraction(1)
-                    )
-                ui.Button(
-                    "Apply Chamfer",
-                    height=BUTTON_HEIGHT,
-                    clicked_fn=self._on_chamfer,
-                )
-
-    def _build_timeline_controls(self):
-        with ui.CollapsableFrame("  Controls", height=0):
-            with ui.VStack(spacing=4):
-                with ui.HStack(height=BUTTON_HEIGHT):
-                    ui.Button(
-                        "Rebuild All",
-                        width=ui.Fraction(1),
-                        clicked_fn=self._on_rebuild_all,
-                    )
-                    ui.Button(
-                        "Clear All",
-                        width=ui.Fraction(1),
-                        clicked_fn=self._on_clear_all,
-                        style={"Button": {"background_color": 0xFF552222}},
-                    )
+    def set_status(self, message: str):
+        # The native toolbar has no status label.  Forward to console.
+        self._hint_text = message
 
     def set_plane_hint(self, text: str):
-        """Update the hint label in the Sketch section."""
-        if self._plane_hint_label is not None:
-            self._plane_hint_label.text = text
+        self._hint_text = text
 
-    # -- Value getters (3D operations only) -----------------------------------
+    # -- Value getters (3D operations) ----------------------------------------
 
     @property
     def extrude_distance(self) -> float:
@@ -357,56 +360,3 @@ class CadToolbar:
     def chamfer_length(self) -> float:
         return self._chamfer_length_model.as_float if self._chamfer_length_model else 1.0
 
-    # -- Callback wrappers ---------------------------------------------------
-
-    def _on_sketch_action(self):
-        if self._sketch_mode:
-            if self.on_finish_sketch:
-                self.on_finish_sketch()
-        else:
-            if self.on_create_sketch:
-                self.on_create_sketch()
-
-    def _on_add_plane(self):
-        if self.on_add_plane:
-            self.on_add_plane()
-
-    def _on_finish_sketch(self):
-        if self.on_finish_sketch:
-            self.on_finish_sketch()
-
-    def _on_tool_line(self):
-        if self.on_tool_line:
-            self.on_tool_line()
-
-    def _on_tool_rectangle(self):
-        if self.on_tool_rectangle:
-            self.on_tool_rectangle()
-
-    def _on_tool_circle(self):
-        if self.on_tool_circle:
-            self.on_tool_circle()
-
-    def _on_extrude(self):
-        if self.on_extrude:
-            self.on_extrude()
-
-    def _on_revolve(self):
-        if self.on_revolve:
-            self.on_revolve()
-
-    def _on_fillet(self):
-        if self.on_fillet:
-            self.on_fillet()
-
-    def _on_chamfer(self):
-        if self.on_chamfer:
-            self.on_chamfer()
-
-    def _on_rebuild_all(self):
-        if self.on_rebuild_all:
-            self.on_rebuild_all()
-
-    def _on_clear_all(self):
-        if self.on_clear_all:
-            self.on_clear_all()
