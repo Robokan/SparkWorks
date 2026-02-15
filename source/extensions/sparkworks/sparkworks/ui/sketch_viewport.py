@@ -63,6 +63,7 @@ class SketchViewport:
         self._scene_view = None
         self._shape_transform = None
         self._primitives: List = []
+        self._hidden_indices: set = set()
         self._plane_name: str = "XY"
         self._info_label = None
         self._coord_label = None
@@ -174,10 +175,11 @@ class SketchViewport:
         if self._info_label:
             self._info_label.text = "No active sketch"
 
-    def update_primitives(self, primitives: list):
+    def update_primitives(self, primitives: list, hidden_indices: set = None):
         if sc is None or self._scene_view is None:
             return
         self._primitives = primitives
+        self._hidden_indices = hidden_indices or set()
         self._redraw()
 
     def set_preview_line(
@@ -363,6 +365,8 @@ class SketchViewport:
             self._shape_transform = sc.Transform()
             with self._shape_transform:
                 for i, prim in enumerate(self._primitives):
+                    if i in self._hidden_indices:
+                        continue
                     is_last = (i == len(self._primitives) - 1)
                     color = SHAPE_HIGHLIGHT_COLOR if is_last else SHAPE_COLOR
                     self._draw_primitive(prim, color)

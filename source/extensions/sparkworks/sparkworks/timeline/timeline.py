@@ -113,6 +113,7 @@ class Timeline:
         self._scrub_index: Optional[int] = None  # None = show latest
         self._current_solid = None
         self._current_sketch_face = None
+        self._current_sketch_all_faces: list = []
 
         # Callbacks
         self.on_rebuild: Optional[Callable] = None
@@ -253,11 +254,13 @@ class Timeline:
         if start_index == 0:
             self._current_solid = None
             self._current_sketch_face = None
+            self._current_sketch_all_faces = []
         else:
             # We'd need cached state at start_index - not implemented yet in Phase 1
             # For now, always rebuild from scratch
             self._current_solid = None
             self._current_sketch_face = None
+            self._current_sketch_all_faces = []
             start_index = 0
 
         context = OperationContext()
@@ -269,18 +272,48 @@ class Timeline:
                 continue
 
             if feature.is_sketch and feature.sketch:
-                # Build the sketch face — this becomes the profile for operations
+                # Build the sketch face — this becomes the profile for operations.
+                # Also cache all faces so operations can select a specific profile.
                 face = feature.sketch.build_face()
                 self._current_sketch_face = face
+                self._current_sketch_all_faces = feature.sketch.build_all_faces()
                 context.sketch_face = face
 
             elif feature.is_operation and feature.operation:
-                # Execute the operation with current context
-                context.sketch_face = self._current_sketch_face
+                op = feature.operation
+                n_faces = len(self._current_sketch_all_faces) if self._current_sketch_all_faces else 0
+
+                # Determine which profile(s) to extrude
+                pis = getattr(op, "profile_indices", [])
+                if not pis:
+                    # Backward compat: fall back to single profile_index
+                    pis = [getattr(op, "profile_index", 0)]
+
+                if self._current_sketch_all_faces:
+                    selected = [
+                        self._current_sketch_all_faces[pi]
+                        for pi in pis
+                        if 0 <= pi < n_faces
+                    ]
+                    if selected:
+                        # Pass faces as a list — the operation will extrude
+                        # each one separately and fuse the resulting solids
+                        context.sketch_faces = selected
+                        context.sketch_face = selected[0]
+                        print(f"[SparkWorks] Using {len(selected)} profile(s) {pis} for '{feature.name}'")
+                    else:
+                        context.sketch_faces = []
+                        context.sketch_face = self._current_sketch_face
+                        print(f"[SparkWorks] Fallback sketch face for '{feature.name}' (pis={pis}, n={n_faces})")
+                else:
+                    context.sketch_faces = []
+                    context.sketch_face = self._current_sketch_face
+                    print(f"[SparkWorks] Using default sketch face for '{feature.name}' (no all_faces)")
+
                 context.current_solid = self._current_solid
                 # Pass the existing solid as join target for face-on-body extrudes
                 context.join_solid = self._current_solid
-                feature.operation.execute(context)
+                op.execute(context)
                 self._current_solid = context.current_solid
 
         self._notify_rebuild()

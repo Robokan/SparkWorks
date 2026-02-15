@@ -70,6 +70,7 @@ class OperationContext:
     """
     current_solid: Optional[Part] = None
     sketch_face = None  # The Face from the active sketch
+    sketch_faces: List = field(default_factory=list)  # Multiple faces for multi-profile extrude
     join_solid: Optional[Part] = None  # Existing solid to fuse into (sketch-on-face)
 
 
@@ -89,36 +90,63 @@ class ExtrudeOperation(BaseOperation):
         neg_distance: Distance for the negative direction (used when both=True)
         join: If True, fuse the extruded solid with ``context.join_solid``
               (used when sketching on a body face).
+        profile_index: Which profile (from ``Sketch.build_all_faces()``) to
+              extrude when a sketch contains multiple extrudable regions.
+              Kept for backward compatibility — prefer ``profile_indices``.
+        profile_indices: A list of profile indices to extrude. When multiple
+              are given their faces are fused before extrusion.
     """
     distance: float = 10.0
     symmetric: bool = False
     both: bool = False
     neg_distance: float = 0.0
     join: bool = False
+    profile_index: int = 0
+    profile_indices: List[int] = field(default_factory=list)
     op_type: OperationType = field(default=OperationType.EXTRUDE, init=False)
 
-    def execute(self, context: OperationContext):
-        if self.suppressed or context.sketch_face is None:
-            return
-
-        sketch_face = context.sketch_face
-
+    def _extrude_single(self, face):
+        """Extrude a single face and return the resulting solid."""
         if self.symmetric:
             half = self.distance / 2.0
             with BuildPart() as part:
-                extrude(sketch_face, amount=half, both=True)
-            new_solid = part.part
-        elif self.both:
-            with BuildPart() as part:
-                extrude(sketch_face, amount=self.distance)
-            new_solid = part.part
+                extrude(face, amount=half, both=True)
+            return part.part
         else:
             with BuildPart() as part:
-                extrude(sketch_face, amount=self.distance)
-            new_solid = part.part
+                extrude(face, amount=self.distance)
+            return part.part
+
+    def execute(self, context: OperationContext):
+        if self.suppressed:
+            return
+
+        # Collect the faces to extrude — prefer the multi-face list
+        faces = context.sketch_faces if context.sketch_faces else []
+        if not faces and context.sketch_face is not None:
+            faces = [context.sketch_face]
+        if not faces:
+            return
+
+        # Extrude each face separately, then fuse the results
+        new_solid = None
+        for face in faces:
+            try:
+                solid = self._extrude_single(face)
+                if solid is None:
+                    continue
+                if new_solid is None:
+                    new_solid = solid
+                else:
+                    new_solid = new_solid.fuse(solid).clean()
+            except Exception as e:
+                print(f"[SparkWorks] Extrude face failed: {e}")
+
+        if new_solid is None:
+            return
 
         # If join mode is active and there's an existing solid, fuse them
-        if self.join and context.join_solid is not None and new_solid is not None:
+        if self.join and context.join_solid is not None:
             try:
                 context.current_solid = context.join_solid.fuse(new_solid).clean()
                 print("[SparkWorks] Fused new extrusion with parent body")
@@ -129,7 +157,7 @@ class ExtrudeOperation(BaseOperation):
             context.current_solid = new_solid
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "type": "extrude",
             "name": self.name,
             "distance": self.distance,
@@ -137,8 +165,12 @@ class ExtrudeOperation(BaseOperation):
             "both": self.both,
             "neg_distance": self.neg_distance,
             "join": self.join,
+            "profile_index": self.profile_index,
             "suppressed": self.suppressed,
         }
+        if self.profile_indices:
+            d["profile_indices"] = list(self.profile_indices)
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "ExtrudeOperation":
@@ -148,6 +180,8 @@ class ExtrudeOperation(BaseOperation):
             both=d.get("both", False),
             neg_distance=d.get("neg_distance", 0.0),
             join=d.get("join", False),
+            profile_index=d.get("profile_index", 0),
+            profile_indices=d.get("profile_indices", []),
         )
         op.name = d.get("name", "Extrude")
         op.suppressed = d.get("suppressed", False)

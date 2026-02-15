@@ -239,6 +239,56 @@ class UsdBridge:
 
         return None
 
+    def is_timeline_prim(self, prim_path: str) -> Optional[str]:
+        """
+        Check whether a USD prim path belongs to a timeline feature.
+
+        Returns:
+            The feature prim name (e.g. "F00_Sketch1") or None.
+        """
+        prefix = self.timeline_root + "/"
+        if prim_path.startswith(prefix):
+            remainder = prim_path[len(prefix):]
+            return remainder.split("/")[0]
+        return None
+
+    def get_hidden_primitive_indices(self, feature_index: int, sketch_name: str) -> set:
+        """
+        Return a set of primitive indices whose USD prims have visibility
+        set to ``"invisible"`` (i.e. the eye icon is toggled off in the
+        stage hierarchy).
+
+        Args:
+            feature_index: The 0-based timeline feature index.
+            sketch_name:   The sketch's human name (e.g. "Sketch1").
+
+        Returns:
+            A set of ``int`` indices (matching the primitive list order).
+        """
+        hidden: set = set()
+        if not USD_AVAILABLE:
+            return hidden
+        stage = self._get_stage()
+        if stage is None:
+            return hidden
+
+        prim_name = f"F{feature_index:02d}_{sketch_name}"
+        prims_path = f"{self.timeline_root}/{prim_name}/Primitives"
+        prims_prim = stage.GetPrimAtPath(prims_path)
+        if not prims_prim or not prims_prim.IsValid():
+            return hidden
+
+        children = list(prims_prim.GetChildren())
+        children.sort(key=lambda p: p.GetName())
+
+        for i, child in enumerate(children):
+            imageable = UsdGeom.Imageable(child)
+            if imageable:
+                vis = imageable.ComputeVisibility()
+                if vis == UsdGeom.Tokens.invisible:
+                    hidden.add(i)
+        return hidden
+
     def is_body_prim(self, prim_path: str) -> Optional[str]:
         """
         Check whether a USD prim path belongs to a body mesh (not a face plane).
@@ -384,6 +434,240 @@ class UsdBridge:
 
         # Double-sided so it's visible from both directions
         mesh.GetDoubleSidedAttr().Set(True)
+
+    # -- Sketch profiles (shaded regions for detected closed loops) ----------
+
+    PROFILES_CHILD = "Profiles"
+
+    def _sketch_profiles_path(self, feature_index: int, sketch_name: str) -> str:
+        """
+        USD path for a sketch's Profiles child Xform.
+
+        Returns e.g. ``/World/SparkWorks/Timeline/F00_Sketch1/Profiles``
+        """
+        safe_name = sketch_name.replace(" ", "_")
+        return (
+            f"{self.timeline_root}/F{feature_index:02d}_{safe_name}"
+            f"/{self.PROFILES_CHILD}"
+        )
+
+    def create_profile_overlays(
+        self,
+        faces: list,
+        sketch_name: str,
+        feature_index: int,
+        plane_normal: Optional[Tuple[float, float, float]] = None,
+        color: Tuple[float, float, float] = (0.2, 0.8, 0.4),
+        opacity: float = 0.35,
+    ) -> List[str]:
+        """
+        Write semi-transparent profile meshes under the sketch's timeline
+        prim.
+
+        Structure::
+
+            /World/SparkWorks/Timeline/F00_Sketch1/Profiles/
+                Profile0   (mesh)
+                Profile1   (mesh)
+
+        Args:
+            faces:         List of build123d Face objects.
+            sketch_name:   Name of the parent sketch.
+            feature_index: Index of the sketch in the timeline.
+            plane_normal:  Fallback normal from the sketch's plane.
+            color:         RGB display colour.
+            opacity:       Display opacity.
+
+        Returns:
+            List of prim paths created.
+        """
+        if not USD_AVAILABLE or not faces:
+            return []
+
+        stage = self._get_stage()
+        if stage is None:
+            return []
+
+        profiles_path = self._sketch_profiles_path(feature_index, sketch_name)
+
+        # Ensure parent Xform exists
+        profiles_prim = stage.GetPrimAtPath(profiles_path)
+        if not profiles_prim.IsValid():
+            UsdGeom.Xform.Define(stage, profiles_path)
+
+        result = []
+        for i, face in enumerate(faces):
+            profile_name = f"Profile{i}"
+            prim_path = f"{profiles_path}/{profile_name}"
+
+            try:
+                # Nudge slightly along face normal so it's visible above the plane
+                nx, ny, nz = 0.0, 0.0, 0.0
+                try:
+                    centre = face.center()
+                    nv = face.normal_at(centre)
+                    nx, ny, nz = float(nv.X), float(nv.Y), float(nv.Z)
+                except Exception:
+                    pass
+
+                # If normal extraction failed, use the sketch plane normal
+                if abs(nx) + abs(ny) + abs(nz) < 1e-6 and plane_normal:
+                    nx, ny, nz = plane_normal
+
+                OFFSET = 0.003
+                INSET_DIST = 0.15  # uniform border width in scene units
+
+                # Inset the face boundary by a fixed distance using OCC
+                # wire offset so the gap is truly uniform on all sides.
+                display_face = face
+                try:
+                    from build123d import make_face as _mk_face
+                    outer = face.outer_wire()
+                    inset_wire = outer.offset_2d(-INSET_DIST)
+                    display_face = _mk_face(inset_wire)
+                except Exception:
+                    pass  # fall back to the original face
+
+                tess = display_face.tessellate(0.001, 0.5)
+                if tess is None:
+                    continue
+                raw_verts, raw_tris = tess
+                if not raw_verts or not raw_tris:
+                    continue
+
+                points = Vt.Vec3fArray([
+                    Gf.Vec3f(
+                        float(v.X) + nx * OFFSET,
+                        float(v.Y) + ny * OFFSET,
+                        float(v.Z) + nz * OFFSET,
+                    )
+                    for v in raw_verts
+                ])
+                fvc = Vt.IntArray([3] * len(raw_tris))
+                fvi = Vt.IntArray([int(idx) for tri in raw_tris for idx in tri])
+
+                mesh = UsdGeom.Mesh.Define(stage, prim_path)
+                mesh.GetPointsAttr().Set(points)
+                mesh.GetFaceVertexCountsAttr().Set(fvc)
+                mesh.GetFaceVertexIndicesAttr().Set(fvi)
+                mesh.GetSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
+
+                # Flat normal
+                n = Gf.Vec3f(nx, ny, nz)
+                mesh.GetNormalsAttr().Set(Vt.Vec3fArray([n] * len(raw_verts)))
+                mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
+
+                mesh.GetDisplayColorAttr().Set(
+                    Vt.Vec3fArray([Gf.Vec3f(*color)])
+                )
+
+                primvars_api = UsdGeom.PrimvarsAPI(mesh)
+                op_pv = primvars_api.CreatePrimvar(
+                    "displayOpacity", Sdf.ValueTypeNames.FloatArray
+                )
+                op_pv.Set(Vt.FloatArray([opacity]))
+                mesh.GetDoubleSidedAttr().Set(True)
+
+                result.append(prim_path)
+                print(f"[SparkWorks] Created profile '{profile_name}' at {prim_path}")
+
+            except Exception as e:
+                print(f"[SparkWorks] Failed to create profile '{profile_name}': {e}")
+                continue
+
+        return result
+
+    def remove_profile_overlays(self, profile_paths: Optional[List[str]] = None):
+        """
+        Remove profile overlay meshes.
+
+        If *profile_paths* is given, remove those specific prims and their
+        parent ``Profiles`` Xform if empty.  Otherwise does nothing (the old
+        global ``Profiles`` scope is no longer used).
+        """
+        if not USD_AVAILABLE:
+            return
+        stage = self._get_stage()
+        if stage is None:
+            return
+
+        if not profile_paths:
+            return
+
+        # Collect unique parent Profiles Xforms
+        parents = set()
+        for pp in profile_paths:
+            prim = stage.GetPrimAtPath(pp)
+            if prim.IsValid():
+                parents.add(str(prim.GetParent().GetPath()))
+                stage.RemovePrim(pp)
+
+        # Remove the Profiles Xform itself if now empty
+        for parent_path in parents:
+            parent_prim = stage.GetPrimAtPath(parent_path)
+            if parent_prim.IsValid() and not list(parent_prim.GetChildren()):
+                stage.RemovePrim(parent_path)
+
+    def is_profile_prim(self, prim_path: str) -> Optional[str]:
+        """
+        Check if a prim path belongs to a profile overlay.
+
+        Profile prims live under
+        ``/World/SparkWorks/Timeline/F*_Sketch*/Profiles/ProfileN``.
+
+        Returns:
+            The profile name (e.g. "Profile0") or ``None``.
+        """
+        tl_prefix = self.timeline_root + "/"
+        if not prim_path.startswith(tl_prefix):
+            return None
+        remainder = prim_path[len(tl_prefix):]
+        # Expected: "F00_Sketch1/Profiles/Profile0"
+        parts = remainder.split("/")
+        if len(parts) >= 3 and parts[1] == self.PROFILES_CHILD:
+            return parts[2]
+        return None
+
+    def highlight_profile(
+        self,
+        profile_paths: List[str],
+        selected_idx: int,
+        selected_color: Tuple[float, float, float] = (0.1, 0.6, 1.0),
+        selected_opacity: float = 0.55,
+        default_color: Tuple[float, float, float] = (0.2, 0.8, 0.4),
+        default_opacity: float = 0.35,
+    ):
+        """
+        Highlight one profile and dim the others.
+
+        Args:
+            profile_paths: List of prim paths for profile overlays.
+            selected_idx:  Which index to highlight.
+            selected_color / selected_opacity: Visual style for the selected profile.
+            default_color / default_opacity: Visual style for non-selected profiles.
+        """
+        if not USD_AVAILABLE or not profile_paths:
+            return
+        stage = self._get_stage()
+        if stage is None:
+            return
+
+        for i, prim_path in enumerate(profile_paths):
+            mesh = UsdGeom.Mesh.Get(stage, prim_path)
+            if not mesh:
+                continue
+            if i == selected_idx:
+                color, opacity = selected_color, selected_opacity
+            else:
+                color, opacity = default_color, default_opacity
+
+            mesh.GetDisplayColorAttr().Set(
+                Vt.Vec3fArray([Gf.Vec3f(*color)])
+            )
+            primvars_api = UsdGeom.PrimvarsAPI(mesh)
+            op_pv = primvars_api.GetPrimvar("displayOpacity")
+            if op_pv:
+                op_pv.Set(Vt.FloatArray([opacity]))
 
     # -- Bodies ---------------------------------------------------------------
 
@@ -772,6 +1056,13 @@ class UsdBridge:
             self._set_attr(prim, f"{NS}:both", operation.both, Sdf.ValueTypeNames.Bool)
             self._set_attr(prim, f"{NS}:negDistance", operation.neg_distance, Sdf.ValueTypeNames.Double)
             self._set_attr(prim, f"{NS}:join", operation.join, Sdf.ValueTypeNames.Bool)
+            self._set_attr(prim, f"{NS}:profileIndex", operation.profile_index, Sdf.ValueTypeNames.Int)
+            if operation.profile_indices:
+                self._set_attr(
+                    prim, f"{NS}:profileIndices",
+                    ",".join(str(i) for i in operation.profile_indices),
+                    Sdf.ValueTypeNames.String,
+                )
 
         elif isinstance(operation, RevolveOperation):
             self._set_attr(prim, f"{NS}:angle", operation.angle, Sdf.ValueTypeNames.Double)
@@ -951,12 +1242,20 @@ class UsdBridge:
         suppressed = _v(f"{NS}:suppressed", False)
 
         if op_type == "extrude":
+            # Read profile_indices (comma-separated string, or fall back to single index)
+            pi_str = _v(f"{NS}:profileIndices", "")
+            if pi_str:
+                profile_indices = [int(x) for x in pi_str.split(",") if x.strip()]
+            else:
+                profile_indices = []
             op = ExtrudeOperation(
                 distance=_v(f"{NS}:distance", 10.0),
                 symmetric=_v(f"{NS}:symmetric", False),
                 both=_v(f"{NS}:both", False),
                 neg_distance=_v(f"{NS}:negDistance", 0.0),
                 join=_v(f"{NS}:join", False),
+                profile_index=_v(f"{NS}:profileIndex", 0),
+                profile_indices=profile_indices,
             )
         elif op_type == "revolve":
             op = RevolveOperation(
