@@ -7,6 +7,10 @@
 #
 # GUI mode (requires X11 forwarding — run `xhost +local:` first):
 #   docker compose -f docker-compose.dev.yml --profile gui up
+#
+# Test mode (headless — runs all tests and exits):
+#   docker compose -f docker-compose.dev.yml --profile test run --rm test
+#   ./run_tests.sh                     # convenience wrapper
 
 services:
   sim:
@@ -78,3 +82,20 @@ services:
       - ${XAUTHORITY:-~/.Xauthority}:/isaac-sim/.Xauthority:ro
     entrypoint: ["/isaac-sim/runapp.sh"]
     command: ["--ext-folder", "/isaac-sim/exts", "--enable", "sparkworks"]
+
+  # Test profile — headless, runs all omni.kit.test tests and exits
+  test:
+    extends:
+      service: sim
+    profiles: ["test"]
+    container_name: isaacsim-cad-test
+    entrypoint: ["/isaac-sim/runheadless.sh", "-v"]
+    command:
+      - "--ext-folder"
+      - "/isaac-sim/exts"
+      - "--enable"
+      - "sparkworks"
+      - "--enable"
+      - "omni.kit.test"
+      - "--/exts/omni.kit.test/testExtId=sparkworks"
+      - "--/exts/omni.kit.test/runTestsAndQuit=true"

@@ -953,6 +953,11 @@ class ParametricCadExtension(omni.ext.IExt):
         self._toolbar.set_active_tool(None)
         self._update_sketch_view()
 
+        # Hide other sketches' primitives to reduce clutter (Fusion 360 style).
+        # The new sketch doesn't have a Primitives prim yet, so pass its name
+        # as the exception (no-op for it, hides everything else).
+        self._bridge.hide_all_sketches(except_sketch=name)
+
         # Clear internal tracking now that a face has been chosen
         self._clear_face_planes()
 
@@ -1218,6 +1223,10 @@ class ParametricCadExtension(omni.ext.IExt):
         self._toolbar.set_sketch_mode(False)
         self._toolbar.set_plane_hint("Click a plane in the viewport to start a sketch")
         self._focus_viewport()
+
+        # Hide the finished sketch entirely (Fusion 360 style —
+        # both primitives and profiles are hidden once finished).
+        self._bridge.set_sketch_visible(finished_sketch.name, False)
 
         # ---- Profile detection & overlay ----
         # After returning to the viewport, detect and visualize closed
@@ -1533,6 +1542,8 @@ class ParametricCadExtension(omni.ext.IExt):
             self._toolbar.set_plane_hint(
                 f"Editing '{feature.sketch.name}' — select a drawing tool"
             )
+            # Hide other sketches, show this one (Fusion 360 style)
+            self._bridge.hide_all_sketches(except_sketch=feature.sketch.name)
             self._show_sketch_in_viewport(feature.sketch)
             self._refresh_profile_overlays_for_active_sketch()
         else:

@@ -690,6 +690,53 @@ class UsdBridge:
             else:
                 img.MakeInvisible()
 
+    def set_sketch_visible(self, sketch_name: str, visible: bool):
+        """
+        Show or hide an entire sketch Xform (primitives **and** profiles).
+
+        In Fusion 360 hiding a sketch hides everything — lines, constraints,
+        and profile regions alike.
+        """
+        if not USD_AVAILABLE:
+            return
+        stage = self._get_stage()
+        if stage is None:
+            return
+        safe_name = sketch_name.replace(" ", "_")
+        sk_path = f"{self.sketches_root}/{safe_name}"
+        prim = stage.GetPrimAtPath(sk_path)
+        if prim.IsValid():
+            img = UsdGeom.Imageable(prim)
+            if visible:
+                img.MakeVisible()
+            else:
+                img.MakeInvisible()
+
+    def hide_all_sketches(self, except_sketch: str = ""):
+        """
+        Hide every sketch in the Sketches scope (primitives + profiles),
+        except for *except_sketch* which is made visible.
+
+        Mimics Fusion 360: when a new sketch is created or an existing one
+        is edited, all other sketches disappear entirely.
+        """
+        if not USD_AVAILABLE:
+            return
+        stage = self._get_stage()
+        if stage is None:
+            return
+        sk_prim = stage.GetPrimAtPath(self.sketches_root)
+        if not sk_prim.IsValid():
+            return
+        safe_except = except_sketch.replace(" ", "_")
+        for child in sk_prim.GetChildren():
+            child_name = child.GetName()
+            img = UsdGeom.Imageable(child)
+            if child_name == safe_except:
+                img.MakeVisible()
+            else:
+                img.MakeInvisible()
+
     def is_profile_prim(self, prim_path: str) -> Optional[str]:
         """
         Check if a prim path belongs to a profile overlay.
