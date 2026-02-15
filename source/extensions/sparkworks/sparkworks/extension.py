@@ -110,6 +110,10 @@ class ParametricCadExtension(omni.ext.IExt):
         self._selection_sub = None
         self._objects_changed_key = None  # Tf.Notice listener for visibility changes
 
+        # -- Dialog state ----
+        self._extrude_dialog_window = None
+        self._extrude_dist_model = None
+
         # -- UI ----
         self._toolbar = CadToolbar()
         self._timeline_panel = TimelinePanel()
@@ -194,6 +198,9 @@ class ParametricCadExtension(omni.ext.IExt):
             self._property_panel.destroy()
         if self._sketch_viewport:
             self._sketch_viewport.destroy()
+        if self._extrude_dialog_window:
+            self._extrude_dialog_window.visible = False
+            self._extrude_dialog_window = None
         self._timeline = None
         self._sketch_registry = None
         self._bridge = None
@@ -1215,21 +1222,76 @@ class ParametricCadExtension(omni.ext.IExt):
             self._set_status("Add and finish a sketch first")
             _notify("Add a sketch first.", "warning")
             return
-        dist = self._toolbar.extrude_distance
+
+        # Show a dialog asking for the extrude distance
+        self._show_extrude_dialog()
+
+    def _show_extrude_dialog(self):
+        """Pop up a small dialog to set the extrude distance, then execute."""
+        # Close any existing dialog first
+        if self._extrude_dialog_window:
+            self._extrude_dialog_window.visible = False
+            self._extrude_dialog_window = None
+
+        self._extrude_dialog_window = ui.Window(
+            "Extrude", width=300, height=120,
+        )
+        self._extrude_dist_model = ui.SimpleFloatModel(10.0)
+
+        # Commit on Enter key in the float field
+        def _on_end_edit(model):
+            self._on_extrude_dialog_ok()
+
+        with self._extrude_dialog_window.frame:
+            with ui.VStack(spacing=6):
+                ui.Spacer(height=4)
+                with ui.HStack(height=24, spacing=4):
+                    ui.Spacer(width=8)
+                    ui.Label("Distance:", width=65)
+                    field = ui.FloatField(
+                        model=self._extrude_dist_model, width=ui.Fraction(1),
+                    )
+                    field.model.add_end_edit_fn(_on_end_edit)
+                    ui.Spacer(width=8)
+                ui.Spacer(height=4)
+                with ui.HStack(height=30, spacing=8):
+                    ui.Spacer(width=8)
+                    ui.Button("OK", width=ui.Fraction(1),
+                              clicked_fn=self._on_extrude_dialog_ok,
+                              style={"Button": {"background_color": 0xFF3A7D44}})
+                    ui.Button("Cancel", width=ui.Fraction(1),
+                              clicked_fn=self._on_extrude_dialog_cancel)
+                    ui.Spacer(width=8)
+                ui.Spacer(height=4)
+
+    def _on_extrude_dialog_ok(self):
+        dist = self._extrude_dist_model.as_float if self._extrude_dist_model else 10.0
+
+        # Close the dialog
+        if self._extrude_dialog_window:
+            self._extrude_dialog_window.visible = False
+            self._extrude_dialog_window = None
+
+        self._execute_extrude(dist)
+
+    def _on_extrude_dialog_cancel(self):
+        if self._extrude_dialog_window:
+            self._extrude_dialog_window.visible = False
+            self._extrude_dialog_window = None
+
+    def _execute_extrude(self, dist: float):
+        """Perform the actual extrude operation with the given distance."""
         self._feature_counter += 1
 
         # Capture the selected profile indices (profiles stay visible after extrude)
         profile_indices = sorted(self._selected_profile_indices) if self._selected_profile_indices else [0]
-        # Also keep profile_index for backward compat (first selected)
         profile_idx = profile_indices[0] if profile_indices else 0
 
         # Determine if this extrude should fuse with a parent body
         is_join = self._sketch_parent_body is not None
         if is_join:
-            # Sketch-on-face: fuse into the same body, don't increment counter
             target_body = self._sketch_parent_body
         else:
-            # New body
             self._body_counter += 1
             target_body = f"Body{self._body_counter}"
 
@@ -1259,7 +1321,7 @@ class ParametricCadExtension(omni.ext.IExt):
             self._set_status(
                 f"Extrude (d={dist}) joined to {self._sketch_parent_body}"
             )
-            self._sketch_parent_body = None  # reset
+            self._sketch_parent_body = None
         else:
             self._set_status(
                 f"Extrude (d={dist}) complete — {self._current_body_name} created"
