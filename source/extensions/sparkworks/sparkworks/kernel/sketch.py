@@ -164,6 +164,14 @@ class Sketch:
     primitives: List = field(default_factory=list)
     # Optional reference to a ConstructionPlane (set when created via viewport click)
     construction_plane: Optional[object] = field(default=None, repr=False)
+    # Optional imported face profile — when set, build_face/build_all_faces
+    # return this face directly instead of building from primitives.  Used
+    # for "extrude face" workflows where the user selects an existing body
+    # face and extrudes it without drawing primitives.
+    face_profile: Optional[object] = field(default=None, repr=False)
+    # Metadata for recreating the face_profile on reload: body name + face index
+    face_profile_body: Optional[str] = field(default=None, repr=False)
+    face_profile_index: Optional[int] = field(default=None, repr=False)
 
     @property
     def plane(self) -> Plane:

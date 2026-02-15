@@ -77,10 +77,14 @@ class ParametricCadExtension(omni.ext.IExt):
         self._bridge = UsdBridge()
         self._tessellator = Tessellator()
 
-        # -- Construction planes ----
+        # -- Construction planes (origin / user-created reference surfaces) ----
         self._construction_planes: List[ConstructionPlane] = create_origin_planes()
-        self._plane_name_map: Dict[str, ConstructionPlane] = {}
+        self._construction_plane_map: Dict[str, ConstructionPlane] = {}
         self._picking_plane: bool = False  # True when waiting for user to pick a plane
+
+        # -- Body face map (B-Rep planar faces on bodies) ----
+        self._face_map: Dict[str, ConstructionPlane] = {}
+        self._selected_face_name: Optional[str] = None  # currently selected body face
         self._last_stage_url: Optional[str] = None  # tracks current file for save-vs-open detection
 
         # -- Active sketch state ----
@@ -100,7 +104,6 @@ class ParametricCadExtension(omni.ext.IExt):
         self._profile_faces: list = []                     # build123d Face objects for each profile
         self._selected_profile_indices: set = set()          # which profiles are selected for extrude
         self._profile_sketch_name: Optional[str] = None    # sketch name that owns current profiles
-        self._profile_feature_index: int = 0               # timeline index of that sketch
         self._profile_plane_normal: Optional[tuple] = None # cached plane normal for recreation
 
         # -- Sketch tool manager (interactive drawing state machine) ----
@@ -203,7 +206,9 @@ class ParametricCadExtension(omni.ext.IExt):
         self._active_sketch = None
         self._sketch_tool = None
         self._construction_planes = []
-        self._plane_name_map = {}
+        self._construction_plane_map = {}
+        self._face_map = {}
+        self._selected_face_name = None
         self._picking_plane = False
         self._face_planes = []
         self._face_plane_body = None
@@ -212,7 +217,6 @@ class ParametricCadExtension(omni.ext.IExt):
         self._profile_faces = []
         self._selected_profile_indices = set()
         self._profile_sketch_name = None
-        self._profile_feature_index = 0
         self._profile_plane_normal = None
 
     # ========================================================================
@@ -346,7 +350,7 @@ class ParametricCadExtension(omni.ext.IExt):
 
         try:
             result = self._bridge.create_construction_planes(self._construction_planes)
-            self._plane_name_map = {
+            self._construction_plane_map = {
                 p.name: p for p in self._construction_planes
             }
             print(f"[{EXTENSION_NAME}] Origin planes created: {list(result.keys())}")
@@ -506,10 +510,19 @@ class ParametricCadExtension(omni.ext.IExt):
                 self._on_timeline_prim_clicked(tl_name)
                 return
 
-            # Construction plane (or face plane)
+            # Origin / user construction plane
             plane_name = self._bridge.is_construction_plane(path)
-            if plane_name and plane_name in self._plane_name_map:
-                plane = self._plane_name_map[plane_name]
+            if plane_name and plane_name in self._construction_plane_map:
+                self._selected_face_name = None  # clear any face selection
+                plane = self._construction_plane_map[plane_name]
+                self._on_construction_plane_clicked(plane)
+                return
+
+            # Body face plane
+            face_name = self._bridge.is_body_face(path)
+            if face_name and face_name in self._face_map:
+                self._selected_face_name = face_name  # track for Extrude
+                plane = self._face_map[face_name]
                 self._on_construction_plane_clicked(plane)
                 return
 
@@ -543,11 +556,11 @@ class ParametricCadExtension(omni.ext.IExt):
             constr_prim = stage.GetPrimAtPath(self._bridge.construction_root) if stage else None
             if constr_prim and constr_prim.IsValid():
                 # Planes already exist in the file — just rebuild the lookup map
-                self._plane_name_map = {p.name: p for p in self._construction_planes}
+                self._construction_plane_map = {p.name: p for p in self._construction_planes}
             else:
                 # No planes in the file — create them
                 result = self._bridge.create_construction_planes(self._construction_planes)
-                self._plane_name_map = {p.name: p for p in self._construction_planes}
+                self._construction_plane_map = {p.name: p for p in self._construction_planes}
         except Exception as e:
             print(f"[{EXTENSION_NAME}] Plane reload error: {e}")
 
@@ -561,7 +574,6 @@ class ParametricCadExtension(omni.ext.IExt):
         self._profile_faces = []
         self._set_profile_selection(set())
         self._profile_sketch_name = None
-        self._profile_feature_index = 0
         self._profile_plane_normal = None
         self._feature_counter = 0
         self._body_counter = 0
@@ -683,16 +695,15 @@ class ParametricCadExtension(omni.ext.IExt):
             self._set_status(f"Body '{body_name}' — click Create Sketch first to sketch on a face")
             return
 
-        solid = self._timeline.current_solid
+        solid = self._timeline.bodies.get(body_name)
         if solid is None:
             self._set_status(f"Body '{body_name}' has no solid geometry")
             return
 
-        # Hide any previously shown face planes from another body
+        # Clear any previously tracked face planes from another body
         self._clear_face_planes()
 
-        # Extract face planes (they may already exist as hidden prims,
-        # but we need the ConstructionPlane objects for plane_name_map)
+        # Extract face planes from this specific body's solid
         face_planes = extract_face_planes(solid, body_name=body_name)
         if not face_planes:
             self._set_status(f"No planar faces found on '{body_name}'")
@@ -703,11 +714,9 @@ class ParametricCadExtension(omni.ext.IExt):
             # Ensure USD prims exist (re-create if missing, e.g. after reload)
             self._bridge.remove_body_face_planes(body_name)
             self._bridge.create_body_face_planes(body_name, face_planes)
-            # Make them visible now (picking mode)
-            self._bridge.set_body_face_planes_visible(body_name, True)
 
             for fp in face_planes:
-                self._plane_name_map[fp.name] = fp
+                self._face_map[fp.name] = fp
             self._face_planes = face_planes
             self._face_plane_body = body_name
             n = len(face_planes)
@@ -729,9 +738,9 @@ class ParametricCadExtension(omni.ext.IExt):
 
     def _recreate_profile_overlays(self, faces: list, selected_indices: set):
         """
-        Re-create profile overlays after a timeline save wiped the USD prims.
+        Re-create profile overlays.
 
-        Uses the cached sketch name, feature index, and plane normal.
+        Uses the cached sketch name and plane normal.
         """
         if not faces or not self._profile_sketch_name:
             return
@@ -739,23 +748,41 @@ class ParametricCadExtension(omni.ext.IExt):
         self._profile_paths = self._bridge.create_profile_overlays(
             faces,
             self._profile_sketch_name,
-            feature_index=self._profile_feature_index,
             plane_normal=self._profile_plane_normal,
         )
         self._set_profile_selection(set(selected_indices) if selected_indices else set())
 
     def _clear_profile_overlays(self):
-        """Remove all profile overlay meshes from the viewport."""
+        """Clear the currently tracked profile overlays.
+
+        Only removes the profiles for the *currently tracked* sketch
+        (``self._profile_sketch_name``).  Other sketches' profiles are
+        left intact — their visibility is managed by
+        ``_sync_profile_visibility`` during scrubbing.
+        """
         if self._profile_paths:
             self._bridge.remove_profile_overlays(self._profile_paths)
-        # Also wipe any lingering profile prims from other sketches
-        self._bridge.remove_all_profile_overlays()
         self._profile_paths = []
         self._profile_faces = []
         self._set_profile_selection(set())
         self._profile_sketch_name = None
-        self._profile_feature_index = 0
         self._profile_plane_normal = None
+
+    def _sync_profile_visibility(self, marker_position: int):
+        """
+        Show profiles for sketches at or before *marker_position*;
+        hide profiles for sketches after the marker.
+
+        Profiles live under ``/World/SparkWorks/Sketches/<name>/Profiles``
+        and are toggled via USD visibility so they persist across saves.
+        """
+        features = self._timeline.features if self._timeline else []
+        for i, feature in enumerate(features):
+            if feature.is_sketch and feature.sketch:
+                visible = (i <= marker_position)
+                self._bridge.set_sketch_profiles_visible(
+                    feature.sketch.name, visible
+                )
 
     def _refresh_profile_overlays_for_active_sketch(self):
         """
@@ -768,13 +795,7 @@ class ParametricCadExtension(omni.ext.IExt):
         if sketch is None:
             return
 
-        # Find the feature index for this sketch
-        feature_index = self._editing_feature_index
-        if feature_index is None:
-            # New sketch not yet in the timeline — use last index
-            feature_index = len(self._timeline.features) - 1
-
-        # Clear old overlays
+        # Clear old overlays for this sketch
         if self._profile_paths:
             self._bridge.remove_profile_overlays(self._profile_paths)
             self._profile_paths = []
@@ -794,13 +815,11 @@ class ParametricCadExtension(omni.ext.IExt):
             pass
 
         self._profile_sketch_name = sketch.name
-        self._profile_feature_index = feature_index
         self._profile_plane_normal = plane_normal
         self._profile_faces = faces
         self._profile_paths = self._bridge.create_profile_overlays(
             faces,
             sketch.name,
-            feature_index=feature_index,
             plane_normal=plane_normal,
         )
         count = len(self._profile_paths)
@@ -813,7 +832,7 @@ class ParametricCadExtension(omni.ext.IExt):
     def _create_profile_overlays(self, sketch: Sketch):
         """
         Detect closed loops in the sketch, build faces, and create
-        semi-transparent overlays under the sketch's timeline prim.
+        semi-transparent overlays under the sketch's Sketches prim.
         """
         # Clear any existing profile overlays first
         self._clear_profile_overlays()
@@ -832,19 +851,14 @@ class ParametricCadExtension(omni.ext.IExt):
         except Exception:
             pass
 
-        # The sketch was just added, so it's the last feature in the timeline
-        feature_index = len(self._timeline.features) - 1
-
-        # Cache info needed to recreate profiles after timeline saves
+        # Cache info needed to recreate profiles
         self._profile_sketch_name = sketch.name
-        self._profile_feature_index = feature_index
         self._profile_plane_normal = plane_normal
 
         self._profile_faces = faces
         self._profile_paths = self._bridge.create_profile_overlays(
             faces,
             sketch.name,
-            feature_index=feature_index,
             plane_normal=plane_normal,
         )
         n = len(self._profile_paths)
@@ -860,27 +874,30 @@ class ParametricCadExtension(omni.ext.IExt):
 
     def _register_all_face_planes(self):
         """
-        Ensure all existing body face planes are in ``_plane_name_map``
+        Ensure all existing body face planes are in ``_face_map``
         so they can be detected when clicked.  Called when entering picking mode.
         """
-        solid = self._timeline.current_solid
-        if solid is None:
+        bodies = self._timeline.bodies
+        if not bodies:
             return
         try:
-            body_names = self._bridge.get_body_names()
-            for bn in body_names:
-                face_planes = extract_face_planes(solid, body_name=bn)
+            for bn, body_solid in bodies.items():
+                if body_solid is None:
+                    continue
+                face_planes = extract_face_planes(body_solid, body_name=bn)
                 for fp in face_planes:
-                    self._plane_name_map[fp.name] = fp
+                    self._face_map[fp.name] = fp
         except Exception as e:
             print(f"[{EXTENSION_NAME}] Error registering face planes: {e}")
 
     def _create_hidden_face_planes(self, body_name: str):
         """
-        Extract face planes from a body and create them as hidden USD prims.
-        Also registers them in ``_plane_name_map`` so clicking them works.
+        Extract face planes from a body and create them as USD prims.
+        Also registers them in ``_face_map`` so clicking them works.
         """
-        solid = self._timeline.current_solid
+        # Look up the specific body's solid — NOT current_solid, which
+        # is just the last solid the timeline touched.
+        solid = self._timeline.bodies.get(body_name)
         if solid is None:
             return
 
@@ -893,11 +910,11 @@ class ParametricCadExtension(omni.ext.IExt):
 
         try:
             self._bridge.create_body_face_planes(body_name, face_planes)
-            # Hide them immediately
-            self._bridge.set_body_face_planes_visible(body_name, False)
-            # Register in the plane lookup so they can be selected
+            # Visibility is managed by the user via the stage tree — do NOT
+            # programmatically hide or show construction planes.
+            # Register in the face lookup so they can be selected
             for fp in face_planes:
-                self._plane_name_map[fp.name] = fp
+                self._face_map[fp.name] = fp
             print(f"[{EXTENSION_NAME}] Pre-created {len(face_planes)} hidden face planes for '{body_name}'")
         except Exception as e:
             print(f"[{EXTENSION_NAME}] Failed to pre-create face planes: {e}")
@@ -905,15 +922,17 @@ class ParametricCadExtension(omni.ext.IExt):
             traceback.print_exc()
 
     def _clear_face_planes(self):
-        """Hide face planes and clear internal tracking state."""
+        """Clear internal face-plane tracking state.
+
+        Visibility is managed by the user via the stage tree — we do NOT
+        programmatically hide or show construction planes here.
+        """
         if self._face_planes:
             for fp in self._face_planes:
-                self._plane_name_map.pop(fp.name, None)
-        # Hide (don't remove) — they stay as hidden prims for future use
-        if self._face_plane_body:
-            self._bridge.set_body_face_planes_visible(self._face_plane_body, False)
+                self._face_map.pop(fp.name, None)
         self._face_planes = []
         self._face_plane_body = None
+        self._selected_face_name = None
 
     def _action_new_sketch_on_plane(self, plane: ConstructionPlane):
         """Create a new sketch on a specific ConstructionPlane."""
@@ -934,9 +953,8 @@ class ParametricCadExtension(omni.ext.IExt):
         self._toolbar.set_active_tool(None)
         self._update_sketch_view()
 
-        # Hide all face planes now that a face has been chosen
+        # Clear internal tracking now that a face has been chosen
         self._clear_face_planes()
-        self._bridge.set_all_face_planes_visible(False)
 
         # Automatically switch to the Sketch View tab
         self._focus_sketch_view()
@@ -1071,8 +1089,12 @@ class ParametricCadExtension(omni.ext.IExt):
         viewport.  If so, use it immediately.  Otherwise enter picking
         mode so the user can click one.
         """
-        # Clear any lingering profile overlays from a previous sketch
-        self._clear_profile_overlays()
+        # Clear tracked profile selection (profiles remain in USD)
+        self._profile_paths = []
+        self._profile_faces = []
+        self._set_profile_selection(set())
+        self._profile_sketch_name = None
+        self._profile_plane_normal = None
 
         # Check if a construction plane is actively selected right now
         currently_selected = self._get_currently_selected_plane()
@@ -1083,8 +1105,7 @@ class ParametricCadExtension(omni.ext.IExt):
         # No plane actively selected — enter picking mode
         self._picking_plane = True
 
-        # Unhide all body face planes and ensure they're in the lookup map
-        self._bridge.set_all_face_planes_visible(True)
+        # Ensure all face planes are in the lookup map so clicking works
         self._register_all_face_planes()
 
         self._set_status("Select a construction plane or a body face")
@@ -1096,8 +1117,9 @@ class ParametricCadExtension(omni.ext.IExt):
     def _get_currently_selected_plane(self) -> Optional[ConstructionPlane]:
         """
         Return the ConstructionPlane if the current USD selection is
-        exactly one construction plane prim.  Otherwise return None.
+        exactly one construction plane or body face prim.  Otherwise return None.
 
+        Checks construction planes first, then body face planes.
         Also sets ``_sketch_parent_body`` when the selected plane is a
         body face plane (needed for join-on-extrude).
         """
@@ -1107,11 +1129,19 @@ class ParametricCadExtension(omni.ext.IExt):
             if not paths or len(paths) != 1:
                 return None
             prim_path = paths[0]
+
+            # Check origin / user construction planes first
             plane_name = self._bridge.is_construction_plane(prim_path)
-            if plane_name and plane_name in self._plane_name_map:
-                plane = self._plane_name_map[plane_name]
+            if plane_name and plane_name in self._construction_plane_map:
+                self._sketch_parent_body = None
+                return self._construction_plane_map[plane_name]
+
+            # Then check body face planes
+            face_name = self._bridge.is_body_face(prim_path)
+            if face_name and face_name in self._face_map:
+                plane = self._face_map[face_name]
                 # Track body for join extrude
-                if "_Face" in plane.name and self._face_plane_body:
+                if self._face_plane_body:
                     self._sketch_parent_body = self._face_plane_body
                 else:
                     self._sketch_parent_body = None
@@ -1224,9 +1254,11 @@ class ParametricCadExtension(omni.ext.IExt):
     # -- 3D operations --------------------------------------------------------
 
     def _action_extrude(self):
-        if not self._timeline.features:
-            self._set_status("Add and finish a sketch first")
-            _notify("Add a sketch first.", "warning")
+        # Allow extrude if a body face is selected (Press/Pull) OR
+        # the timeline has features (sketch-based extrude).
+        if not self._selected_face_name and not self._timeline.features:
+            self._set_status("Select a body face or add a sketch first")
+            _notify("Select a body face or add a sketch first.", "warning")
             return
 
         # Show a dialog asking for the extrude distance
@@ -1239,8 +1271,9 @@ class ParametricCadExtension(omni.ext.IExt):
             self._extrude_dialog_window.visible = False
             self._extrude_dialog_window = None
 
+        title = "Extrude Face" if self._selected_face_name else "Extrude"
         self._extrude_dialog_window = ui.Window(
-            "Extrude", width=300, height=120,
+            title, width=300, height=120,
         )
         self._extrude_dist_model = ui.SimpleFloatModel(10.0)
 
@@ -1285,53 +1318,108 @@ class ParametricCadExtension(omni.ext.IExt):
             self._extrude_dialog_window.visible = False
             self._extrude_dialog_window = None
 
+    @staticmethod
+    def _parse_face_name(face_name: str):
+        """
+        Parse a face key like ``"Body1_Face3"`` into ``("Body1", 3)``.
+
+        Returns ``(None, -1)`` if the format is unexpected.
+        """
+        try:
+            idx = face_name.rfind("_Face")
+            if idx < 0:
+                return (None, -1)
+            body = face_name[:idx]
+            face_idx = int(face_name[idx + 5:])
+            return (body, face_idx)
+        except (ValueError, IndexError):
+            return (None, -1)
+
     def _execute_extrude(self, dist: float):
         """Perform the actual extrude operation with the given distance."""
         self._feature_counter += 1
 
-        # Capture the selected profile indices (profiles stay visible after extrude)
-        profile_indices = sorted(self._selected_profile_indices) if self._selected_profile_indices else [0]
-        profile_idx = profile_indices[0] if profile_indices else 0
+        # ── Face-based extrude (Press/Pull) ──────────────────────────
+        if self._selected_face_name:
+            src_body, face_idx = self._parse_face_name(self._selected_face_name)
+            if src_body is None or face_idx < 0:
+                self._set_status("Could not resolve selected face")
+                _notify("Invalid face selection.", "warning")
+                return
 
-        # Determine if this extrude should fuse with a parent body
-        is_join = self._sketch_parent_body is not None
-        if is_join:
-            target_body = self._sketch_parent_body
-        else:
-            self._body_counter += 1
-            target_body = f"Body{self._body_counter}"
-
-        op = ExtrudeOperation(
-            distance=dist,
-            join=is_join,
-            body_name=target_body,
-            join_body_name=self._sketch_parent_body or "",
-            profile_index=profile_idx,
-            profile_indices=profile_indices,
-        )
-        op.name = f"Extrude{self._feature_counter}"
-        self._current_body_name = target_body
-        print(f"[{EXTENSION_NAME}] Extrude: distance={dist}, body={target_body}, profile_indices={profile_indices}, join={is_join}")
-
-        if is_join:
-            self._set_status(
-                f"Extruding {dist} units (join onto {self._sketch_parent_body})..."
+            # Always fuse with the source body (like Fusion 360 Press/Pull)
+            target_body = src_body
+            op = ExtrudeOperation(
+                distance=dist,
+                join=True,
+                body_name=target_body,
+                join_body_name=src_body,
+                face_body_name=src_body,
+                face_index=face_idx,
             )
-        else:
-            self._set_status(f"Extruding {dist} units...")
-
-        marker = self._timeline_panel.marker_position
-        self._timeline.add_operation(op, name=op.name, insert_after=marker)
-
-        if is_join:
-            self._set_status(
-                f"Extrude (d={dist}) joined to {self._sketch_parent_body}"
+            op.name = f"Extrude{self._feature_counter}"
+            self._current_body_name = target_body
+            print(
+                f"[{EXTENSION_NAME}] Face extrude: distance={dist}, "
+                f"face={self._selected_face_name}, body={target_body}"
             )
-            self._sketch_parent_body = None
-        else:
             self._set_status(
-                f"Extrude (d={dist}) complete — {self._current_body_name} created"
+                f"Extruding face {face_idx} on '{src_body}' by {dist} units..."
             )
+
+            marker = self._timeline_panel.marker_position
+            self._timeline.add_operation(op, name=op.name, insert_after=marker)
+            self._set_status(
+                f"Extrude (d={dist}) fused onto {src_body}"
+            )
+            self._selected_face_name = None  # consumed
+
+        # ── Sketch-profile-based extrude ─────────────────────────────
+        else:
+            profile_indices = sorted(self._selected_profile_indices) if self._selected_profile_indices else [0]
+            profile_idx = profile_indices[0] if profile_indices else 0
+
+            is_join = self._sketch_parent_body is not None
+            if is_join:
+                target_body = self._sketch_parent_body
+            else:
+                self._body_counter += 1
+                target_body = f"Body{self._body_counter}"
+
+            op = ExtrudeOperation(
+                distance=dist,
+                join=is_join,
+                body_name=target_body,
+                join_body_name=self._sketch_parent_body or "",
+                profile_index=profile_idx,
+                profile_indices=profile_indices,
+            )
+            op.name = f"Extrude{self._feature_counter}"
+            self._current_body_name = target_body
+            print(
+                f"[{EXTENSION_NAME}] Extrude: distance={dist}, body={target_body}, "
+                f"profile_indices={profile_indices}, join={is_join}"
+            )
+
+            if is_join:
+                self._set_status(
+                    f"Extruding {dist} units (join onto {self._sketch_parent_body})..."
+                )
+            else:
+                self._set_status(f"Extruding {dist} units...")
+
+            marker = self._timeline_panel.marker_position
+            self._timeline.add_operation(op, name=op.name, insert_after=marker)
+
+            if is_join:
+                self._set_status(
+                    f"Extrude (d={dist}) joined to {self._sketch_parent_body}"
+                )
+                self._sketch_parent_body = None
+            else:
+                self._set_status(
+                    f"Extrude (d={dist}) complete — {self._current_body_name} created"
+                )
 
         # Select the newly created/updated body in the viewport
         body_path = f"{self._bridge.bodies_root}/{self._current_body_name}"
@@ -1405,7 +1493,6 @@ class ParametricCadExtension(omni.ext.IExt):
         self._profile_faces = []
         self._set_profile_selection(set())
         self._profile_sketch_name = None
-        self._profile_feature_index = 0
         self._profile_plane_normal = None
         self._sketch_tool.deactivate()
         self._toolbar.set_active_tool(None)
@@ -1456,7 +1543,13 @@ class ParametricCadExtension(omni.ext.IExt):
             self._toolbar.set_sketch_mode(False)
             self._sketch_viewport.update_primitives([])
             self._sketch_viewport.clear_info()
-            self._clear_profile_overlays()
+            # Clear tracked selection but leave profile prims in USD —
+            # their visibility is managed by _sync_profile_visibility.
+            self._profile_paths = []
+            self._profile_faces = []
+            self._set_profile_selection(set())
+            self._profile_sketch_name = None
+            self._profile_plane_normal = None
 
     def _action_marker_moved(self, position: int):
         """
@@ -1465,8 +1558,12 @@ class ParametricCadExtension(omni.ext.IExt):
         ``position`` is the index of the last *included* feature.
         -1 = before all features (nothing visible).
         """
-        # Moving the marker always clears profile overlays
-        self._clear_profile_overlays()
+        # Reset tracked profile selection (we're scrubbing, not selecting)
+        self._profile_paths = []
+        self._profile_faces = []
+        self._set_profile_selection(set())
+        self._profile_sketch_name = None
+        self._profile_plane_normal = None
 
         if position < 0:
             # Before all features — clear geometry
@@ -1485,6 +1582,10 @@ class ParametricCadExtension(omni.ext.IExt):
             self._set_status(
                 f"Marker after feature #{position + 1}"
             )
+
+        # Toggle profile visibility: show for sketches at/before marker,
+        # hide for sketches after marker.
+        self._sync_profile_visibility(position)
 
     def _action_scrub_to(self, index: int):
         """Convenience: move marker + select the feature at *index*."""
@@ -1577,17 +1678,9 @@ class ParametricCadExtension(omni.ext.IExt):
         except Exception as e:
             print(f"[{EXTENSION_NAME}] Timeline panel update error: {e}")
 
-        # Always persist timeline to USD, even if panel update failed
-        # (this wipes and rewrites the Timeline Xform, destroying profile prims)
-        saved_faces = self._profile_faces
-        saved_indices = set(self._selected_profile_indices)
-        self._profile_paths = []  # paths are stale after rewrite
-
+        # Persist timeline to USD.  Profiles now live under Sketches (not
+        # Timeline), so they are NOT destroyed by this save.
         self._save_timeline_to_usd()
-
-        # Re-create profile overlays if they should still be visible
-        if saved_faces:
-            self._recreate_profile_overlays(saved_faces, saved_indices)
 
     def _save_timeline_to_usd(self):
         """Save both the sketch registry and timeline features to USD."""

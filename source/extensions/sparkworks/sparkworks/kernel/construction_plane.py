@@ -343,6 +343,44 @@ def extract_face_planes(
 
 
 # ---------------------------------------------------------------------------
+# Planar-face lookup by index (for extrude-from-face rebuild)
+# ---------------------------------------------------------------------------
+
+def get_planar_face(solid, face_index: int):
+    """
+    Return the *face_index*-th **planar** face from *solid*.
+
+    Uses the same enumeration order and planarity check as
+    ``extract_face_planes``, so ``face_index`` values stored in
+    ``ExtrudeOperation`` stay consistent across rebuilds.
+
+    Returns:
+        The ``build123d.Face`` or ``None`` if the index is out of range.
+    """
+    if solid is None:
+        return None
+    try:
+        faces = solid.faces()
+    except Exception:
+        return None
+
+    planar_idx = 0
+    for face in faces:
+        try:
+            geom = face.geom_type
+            if callable(geom):
+                geom = geom()
+            if "PLANE" not in str(geom).upper():
+                continue
+            if planar_idx == face_index:
+                return face
+            planar_idx += 1
+        except Exception:
+            continue
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Factory helpers
 # ---------------------------------------------------------------------------
 

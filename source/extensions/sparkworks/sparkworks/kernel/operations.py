@@ -98,6 +98,11 @@ class ExtrudeOperation(BaseOperation):
               Kept for backward compatibility — prefer ``profile_indices``.
         profile_indices: A list of profile indices to extrude. When multiple
               are given their faces are fused before extrusion.
+        face_body_name: When set, extrude directly from a body face instead
+              of a sketch profile (Fusion 360 Press/Pull style).  The face is
+              resolved from the body solid during timeline rebuild.
+        face_index: Index of the planar face on ``face_body_name`` to extrude.
+              Only used when ``face_body_name`` is set.
     """
     distance: float = 10.0
     symmetric: bool = False
@@ -108,6 +113,8 @@ class ExtrudeOperation(BaseOperation):
     join_body_name: str = ""
     profile_index: int = 0
     profile_indices: List[int] = field(default_factory=list)
+    face_body_name: str = ""
+    face_index: int = -1
     op_type: OperationType = field(default=OperationType.EXTRUDE, init=False)
 
     def _extrude_single(self, face):
@@ -177,6 +184,9 @@ class ExtrudeOperation(BaseOperation):
         }
         if self.profile_indices:
             d["profile_indices"] = list(self.profile_indices)
+        if self.face_body_name:
+            d["face_body_name"] = self.face_body_name
+            d["face_index"] = self.face_index
         return d
 
     @classmethod
@@ -191,6 +201,8 @@ class ExtrudeOperation(BaseOperation):
             join_body_name=d.get("join_body_name", ""),
             profile_index=d.get("profile_index", 0),
             profile_indices=d.get("profile_indices", []),
+            face_body_name=d.get("face_body_name", ""),
+            face_index=d.get("face_index", -1),
         )
         op.name = d.get("name", "Extrude")
         op.suppressed = d.get("suppressed", False)

@@ -208,25 +208,28 @@ class UsdBridge:
 
     def is_construction_plane(self, prim_path: str) -> Optional[str]:
         """
-        Check whether a USD prim path belongs to a construction plane.
-
-        Handles both global origin planes under
-        ``/World/SparkWorks/Construction/<name>`` and per-body face planes
-        under ``/World/SparkWorks/Bodies/<body>/Construction/<face>``.
+        Check whether a USD prim path belongs to an origin / user construction plane
+        under ``/World/SparkWorks/Construction/<name>``.
 
         Returns:
-            The plane name used as the lookup key in ``_plane_name_map``:
-            - Origin planes: e.g. ``"XY"``
-            - Face planes: e.g. ``"Body1_Face0"``
-            Returns ``None`` if the path is not a construction plane.
+            The plane name (e.g. ``"XY"``, ``"XZ"``, ``"YZ"``), or ``None``
+            if the path is not a construction plane.
         """
-        # 1) Global origin planes: /World/SparkWorks/Construction/<name>
         prefix = self.construction_root + "/"
         if prim_path.startswith(prefix):
             remainder = prim_path[len(prefix):]
             return remainder.split("/")[0]
+        return None
 
-        # 2) Per-body face planes: /World/SparkWorks/Bodies/<body>/Construction/<face>
+    def is_body_face(self, prim_path: str) -> Optional[str]:
+        """
+        Check whether a USD prim path belongs to a body face plane
+        under ``/World/SparkWorks/Bodies/<body>/Construction/<face>``.
+
+        Returns:
+            The face key (e.g. ``"Body1_Face0"``), or ``None``
+            if the path is not a body face plane.
+        """
         bodies_prefix = self.bodies_root + "/"
         if prim_path.startswith(bodies_prefix):
             remainder = prim_path[len(bodies_prefix):]
@@ -235,9 +238,7 @@ class UsdBridge:
             if len(parts) >= 3 and parts[1] == "Construction":
                 body_name = parts[0]
                 face_label = parts[2]
-                # Reconstruct the plane name key: "Body1_Face0"
                 return f"{body_name}_{face_label}"
-
         return None
 
     def is_timeline_prim(self, prim_path: str) -> Optional[str]:
@@ -483,41 +484,38 @@ class UsdBridge:
 
     PROFILES_CHILD = "Profiles"
 
-    def _sketch_profiles_path(self, feature_index: int, sketch_name: str) -> str:
+    def _sketch_profiles_path(self, sketch_name: str) -> str:
         """
         USD path for a sketch's Profiles child Xform.
 
-        Returns e.g. ``/World/SparkWorks/Timeline/F00_Sketch1/Profiles``
+        Profiles now live under Sketches (not Timeline), e.g.::
+
+            /World/SparkWorks/Sketches/Sketch1/Profiles
         """
         safe_name = sketch_name.replace(" ", "_")
-        return (
-            f"{self.timeline_root}/F{feature_index:02d}_{safe_name}"
-            f"/{self.PROFILES_CHILD}"
-        )
+        return f"{self.sketches_root}/{safe_name}/{self.PROFILES_CHILD}"
 
     def create_profile_overlays(
         self,
         faces: list,
         sketch_name: str,
-        feature_index: int,
         plane_normal: Optional[Tuple[float, float, float]] = None,
         color: Tuple[float, float, float] = (0.2, 0.8, 0.4),
         opacity: float = 0.15,
     ) -> List[str]:
         """
-        Write semi-transparent profile meshes under the sketch's timeline
-        prim.
+        Write semi-transparent profile meshes under the sketch in the
+        Sketches hierarchy.
 
         Structure::
 
-            /World/SparkWorks/Timeline/F00_Sketch1/Profiles/
+            /World/SparkWorks/Sketches/Sketch1/Profiles/
                 Profile0   (mesh)
                 Profile1   (mesh)
 
         Args:
             faces:         List of build123d Face objects.
             sketch_name:   Name of the parent sketch.
-            feature_index: Index of the sketch in the timeline.
             plane_normal:  Fallback normal from the sketch's plane.
             color:         RGB display colour.
             opacity:       Display opacity.
@@ -532,7 +530,7 @@ class UsdBridge:
         if stage is None:
             return []
 
-        profiles_path = self._sketch_profiles_path(feature_index, sketch_name)
+        profiles_path = self._sketch_profiles_path(sketch_name)
 
         # Ensure parent Xform exists
         profiles_prim = stage.GetPrimAtPath(profiles_path)
@@ -654,40 +652,59 @@ class UsdBridge:
 
     def remove_all_profile_overlays(self):
         """
-        Remove every ``Profiles`` child under every sketch feature in the
-        timeline.  This guarantees no stale profile meshes remain visible
-        after a marker move / scrub.
+        Remove every ``Profiles`` child under every sketch in the
+        Sketches hierarchy.
         """
         if not USD_AVAILABLE:
             return
         stage = self._get_stage()
         if stage is None:
             return
-        tl_path = self.timeline_root
-        tl_prim = stage.GetPrimAtPath(tl_path)
-        if not tl_prim.IsValid():
+        sk_prim = stage.GetPrimAtPath(self.sketches_root)
+        if not sk_prim.IsValid():
             return
-        for child in tl_prim.GetChildren():
+        for child in sk_prim.GetChildren():
             profiles_path = f"{child.GetPath()}/{self.PROFILES_CHILD}"
             profiles_prim = stage.GetPrimAtPath(profiles_path)
             if profiles_prim.IsValid():
                 stage.RemovePrim(profiles_path)
+
+    def set_sketch_profiles_visible(self, sketch_name: str, visible: bool):
+        """
+        Show or hide the Profiles child of a specific sketch.
+
+        This is used during timeline scrubbing to hide profiles for
+        sketches that are after the current marker position.
+        """
+        if not USD_AVAILABLE:
+            return
+        stage = self._get_stage()
+        if stage is None:
+            return
+        profiles_path = self._sketch_profiles_path(sketch_name)
+        prim = stage.GetPrimAtPath(profiles_path)
+        if prim.IsValid():
+            img = UsdGeom.Imageable(prim)
+            if visible:
+                img.MakeVisible()
+            else:
+                img.MakeInvisible()
 
     def is_profile_prim(self, prim_path: str) -> Optional[str]:
         """
         Check if a prim path belongs to a profile overlay.
 
         Profile prims live under
-        ``/World/SparkWorks/Timeline/F*_Sketch*/Profiles/ProfileN``.
+        ``/World/SparkWorks/Sketches/Sketch1/Profiles/ProfileN``.
 
         Returns:
             The profile name (e.g. "Profile0") or ``None``.
         """
-        tl_prefix = self.timeline_root + "/"
-        if not prim_path.startswith(tl_prefix):
+        sk_prefix = self.sketches_root + "/"
+        if not prim_path.startswith(sk_prefix):
             return None
-        remainder = prim_path[len(tl_prefix):]
-        # Expected: "F00_Sketch1/Profiles/Profile0"
+        remainder = prim_path[len(sk_prefix):]
+        # Expected: "Sketch1/Profiles/Profile0"
         parts = remainder.split("/")
         if len(parts) >= 3 and parts[1] == self.PROFILES_CHILD:
             return parts[2]
@@ -928,11 +945,16 @@ class UsdBridge:
                     sparkworks:sketchName = "Sketch1"
                     Primitives/
                         Line_000/  ...
+                    Profiles/          <-- preserved across saves
+                        Profile0
                 Sketch2/
                     ...
 
         The sketch data is independent of the timeline — just like
         Fusion 360's Sketches folder.
+
+        **Important**: Profiles children are preserved across saves.
+        Only sketch attributes and Primitives are rewritten.
         """
         if not USD_AVAILABLE:
             return False
@@ -945,19 +967,40 @@ class UsdBridge:
 
         sk_path = self.sketches_root
         sk_prim = stage.GetPrimAtPath(sk_path)
-        if sk_prim.IsValid():
-            stage.RemovePrim(sk_path)
 
-        UsdGeom.Xform.Define(stage, sk_path)
+        # Instead of wiping the entire Sketches scope (which would
+        # destroy Profile prims), selectively clear each sketch's
+        # attributes and Primitives child while preserving Profiles.
+        if sk_prim.IsValid():
+            for child in sk_prim.GetChildren():
+                # Remove Primitives sub-prim (will be rewritten)
+                prims_path = f"{child.GetPath()}/Primitives"
+                prims_prim = stage.GetPrimAtPath(prims_path)
+                if prims_prim.IsValid():
+                    stage.RemovePrim(prims_path)
+        else:
+            UsdGeom.Xform.Define(stage, sk_path)
+
         # Save the counter for name generation continuity
         xf = stage.GetPrimAtPath(sk_path)
         self._set_attr(xf, f"{NS}:counter", sketch_registry.counter, Sdf.ValueTypeNames.Int)
 
+        # Remove sketches that no longer exist in the registry
+        if sk_prim.IsValid():
+            existing_ids = set()
+            for child in sk_prim.GetChildren():
+                existing_ids.add(child.GetName())
+            registry_ids = {sid.replace(" ", "_") for sid in sketch_registry.sketches}
+            for stale_id in existing_ids - registry_ids:
+                stage.RemovePrim(f"{sk_path}/{stale_id}")
+
         for sketch_id, sketch in sketch_registry.sketches.items():
             safe_id = sketch_id.replace(" ", "_")
             child_path = f"{sk_path}/{safe_id}"
-            xform = UsdGeom.Xform.Define(stage, child_path)
-            prim = xform.GetPrim()
+            child_prim = stage.GetPrimAtPath(child_path)
+            if not child_prim.IsValid():
+                UsdGeom.Xform.Define(stage, child_path)
+            prim = stage.GetPrimAtPath(child_path)
             # Reuse the existing _write_sketch_attrs to persist sketch data
             self._write_sketch_attrs(stage, child_path, prim, sketch)
             print(f"[SparkWorks] Wrote sketch '{sketch_id}' at {child_path}")

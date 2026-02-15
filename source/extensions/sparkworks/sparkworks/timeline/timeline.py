@@ -20,6 +20,7 @@ from enum import Enum, auto
 from typing import Callable, Dict, List, Optional, Any, TYPE_CHECKING
 
 from ..kernel.sketch import Sketch, primitive_from_dict
+from ..kernel.construction_plane import get_planar_face
 from ..kernel.operations import (
     BaseOperation,
     ExtrudeOperation,
@@ -148,6 +149,12 @@ class Timeline:
         # update an existing entry.
         self._bodies: Dict[str, Any] = {}
 
+        # ── Snapshot cache for fast scrubbing ───────────────────────
+        # Maps feature index → frozen state *after* that feature was
+        # replayed.  OCC/build123d shapes are immutable so shallow
+        # copies of the dicts/lists are safe.
+        self._snapshots: Dict[int, Dict[str, Any]] = {}
+
         # The SketchRegistry that owns all Sketch objects.
         # Features store only sketch_id; the registry resolves them.
         self._sketch_registry: Optional["SketchRegistry"] = sketch_registry
@@ -239,8 +246,9 @@ class Timeline:
         idx = self._insert_feature(feature, insert_after)
         # Place the marker right after the newly inserted feature
         self._scrub_index = idx
+        self._invalidate_snapshots(idx)
         self._notify_changed()
-        self.rebuild_from(0)
+        self.rebuild_from(idx)
         return feature
 
     def add_operation(
@@ -264,8 +272,9 @@ class Timeline:
         idx = self._insert_feature(feature, insert_after)
         # Place the marker right after the newly inserted feature
         self._scrub_index = idx
+        self._invalidate_snapshots(idx)
         self._notify_changed()
-        self.rebuild_from(0)
+        self.rebuild_from(idx)
         return feature
 
     def _insert_feature(self, feature: Feature, insert_after: Optional[int]) -> int:
@@ -299,6 +308,7 @@ class Timeline:
                 if not still_used:
                     self._sketch_registry.remove(removed.sketch_id)
             rebuild_from = max(0, index - 1) if self._features else 0
+            self._invalidate_snapshots(rebuild_from)
             self._notify_changed()
             if self._features:
                 self.rebuild_from(rebuild_from)
@@ -306,6 +316,7 @@ class Timeline:
                 self._current_solid = None
                 self._current_sketch_face = None
                 self._bodies = {}
+                self._snapshots.clear()
                 self._notify_rebuild()
 
     def move_feature(self, from_index: int, to_index: int):
@@ -320,6 +331,7 @@ class Timeline:
         feature = self._features.pop(from_index)
         self._features.insert(to_index, feature)
         rebuild_from = min(from_index, to_index)
+        self._invalidate_snapshots(rebuild_from)
         self._notify_changed()
         self.rebuild_from(rebuild_from)
 
@@ -329,6 +341,7 @@ class Timeline:
             self._features[index].suppressed = suppressed
             if self._features[index].operation:
                 self._features[index].operation.suppressed = suppressed
+            self._invalidate_snapshots(index)
             self._notify_changed()
             self.rebuild_from(index)
 
@@ -354,6 +367,7 @@ class Timeline:
                 if hasattr(feature.sketch, key):
                     setattr(feature.sketch, key, value)
 
+        self._invalidate_snapshots(index)
         self._notify_changed()
         self.rebuild_from(index)
 
@@ -361,42 +375,73 @@ class Timeline:
 
     def rebuild_from(self, start_index: int = 0):
         """
-        Rebuild the model from start_index forward.
+        Rebuild the model from *start_index* forward.
 
-        This is the core parametric rebuild: we replay all features from
-        start_index to the current scrub position, accumulating geometry.
+        Uses a **snapshot cache** to avoid replaying the entire history
+        every time.  The cache stores the state (bodies, current solid,
+        sketch faces) after each feature, keyed by feature index.
+
+        * Moving the marker **backward** is O(1) — just restore the
+          snapshot at the target position.
+        * Moving **forward** replays only the delta from the nearest
+          upstream snapshot.
+        * Editing a feature invalidates all snapshots at and after that
+          index, so the next rebuild replays from there.
         """
         # Determine end point (scrub position or end of list)
         end_index = self.scrub_index + 1 if self._scrub_index is not None else len(self._features)
         end_index = min(end_index, len(self._features))
 
-        # Start fresh if rebuilding from the beginning
-        if start_index == 0:
-            self._current_solid = None
-            self._current_sketch_face = None
-            self._current_sketch_all_faces = []
-            self._bodies = {}
-        else:
-            # We'd need cached state at start_index - not implemented yet
-            # For now, always rebuild from scratch
+        # ── Try to restore from a snapshot ──────────────────────────
+        # Find the best cached snapshot strictly *before* end_index
+        # that is at or after start_index.
+        restored = False
+        if self._snapshots:
+            # Check if we have an exact snapshot for end_index - 1
+            # (the last feature we need).  If so, just restore it
+            # without replaying anything.
+            target = end_index - 1
+            if target in self._snapshots:
+                self._restore_snapshot(target)
+                self._notify_rebuild()
+                return
+
+            # Otherwise find the nearest snapshot before end_index
+            # that lets us skip some replay.
+            best = -1
+            for idx in self._snapshots:
+                if start_index <= idx < end_index and idx > best:
+                    best = idx
+            if best >= 0:
+                self._restore_snapshot(best)
+                start_index = best + 1
+                restored = True
+
+        # ── Fresh start (no usable snapshot) ────────────────────────
+        if not restored:
             self._current_solid = None
             self._current_sketch_face = None
             self._current_sketch_all_faces = []
             self._bodies = {}
             start_index = 0
 
+        # ── Replay features from start_index to end_index ───────────
         context = OperationContext()
 
         for i in range(start_index, end_index):
             feature = self._features[i]
 
             if feature.suppressed:
+                # Still save a snapshot so we can skip past suppressed
+                # features on future scrubs.
+                self._save_snapshot(i)
                 continue
 
             if feature.is_sketch and feature.sketch_id:
                 sketch = feature.sketch  # property resolves from registry
                 if sketch is None:
                     print(f"[SparkWorks] WARNING: sketch '{feature.sketch_id}' not found in registry")
+                    self._save_snapshot(i)
                     continue
                 face = sketch.build_face()
                 self._current_sketch_face = face
@@ -405,28 +450,45 @@ class Timeline:
 
             elif feature.is_operation and feature.operation:
                 op = feature.operation
-                n_faces = len(self._current_sketch_all_faces) if self._current_sketch_all_faces else 0
 
-                # Determine which profile(s) to use
-                pis = getattr(op, "profile_indices", [])
-                if not pis:
-                    pis = [getattr(op, "profile_index", 0)]
+                # ── Face-based extrude (Press/Pull) ──────────────────
+                face_body = getattr(op, "face_body_name", "")
+                face_idx = getattr(op, "face_index", -1)
 
-                if self._current_sketch_all_faces:
-                    selected = [
-                        self._current_sketch_all_faces[pi]
-                        for pi in pis
-                        if 0 <= pi < n_faces
-                    ]
-                    if selected:
-                        context.sketch_faces = selected
-                        context.sketch_face = selected[0]
+                if face_body and face_idx >= 0:
+                    # Resolve the face directly from the body solid
+                    src_solid = self._bodies.get(face_body)
+                    face = get_planar_face(src_solid, face_idx) if src_solid else None
+                    if face is not None:
+                        context.sketch_face = face
+                        context.sketch_faces = [face]
+                    else:
+                        print(f"[SparkWorks] WARNING: could not resolve face {face_idx} on '{face_body}'")
+                        context.sketch_face = None
+                        context.sketch_faces = []
+                else:
+                    # ── Sketch-profile-based extrude ─────────────────
+                    n_faces = len(self._current_sketch_all_faces) if self._current_sketch_all_faces else 0
+
+                    pis = getattr(op, "profile_indices", [])
+                    if not pis:
+                        pis = [getattr(op, "profile_index", 0)]
+
+                    if self._current_sketch_all_faces:
+                        selected = [
+                            self._current_sketch_all_faces[pi]
+                            for pi in pis
+                            if 0 <= pi < n_faces
+                        ]
+                        if selected:
+                            context.sketch_faces = selected
+                            context.sketch_face = selected[0]
+                        else:
+                            context.sketch_faces = []
+                            context.sketch_face = self._current_sketch_face
                     else:
                         context.sketch_faces = []
                         context.sketch_face = self._current_sketch_face
-                else:
-                    context.sketch_faces = []
-                    context.sketch_face = self._current_sketch_face
 
                 # Resolve join target from the bodies dict
                 body_name = getattr(op, "body_name", "")
@@ -445,11 +507,48 @@ class Timeline:
                 if body_name and context.current_solid is not None:
                     self._bodies[body_name] = context.current_solid
 
+            # Cache this position for future scrubs
+            self._save_snapshot(i)
+
         self._notify_rebuild()
 
     def rebuild_all(self):
         """Full rebuild from the beginning."""
         self.rebuild_from(0)
+
+    # -- Snapshot cache ------------------------------------------------------
+
+    def _save_snapshot(self, index: int):
+        """Store the current state keyed by feature *index*."""
+        self._snapshots[index] = {
+            "current_solid": self._current_solid,
+            "sketch_face": self._current_sketch_face,
+            "sketch_all_faces": list(self._current_sketch_all_faces),
+            "bodies": dict(self._bodies),
+        }
+
+    def _restore_snapshot(self, index: int):
+        """Restore state from a cached snapshot at *index*."""
+        snap = self._snapshots[index]
+        self._current_solid = snap["current_solid"]
+        self._current_sketch_face = snap["sketch_face"]
+        self._current_sketch_all_faces = list(snap["sketch_all_faces"])
+        self._bodies = dict(snap["bodies"])
+
+    def _invalidate_snapshots(self, from_index: int = 0):
+        """
+        Remove all cached snapshots at or after *from_index*.
+
+        Called whenever a feature is added, removed, moved, suppressed,
+        or edited — anything that makes downstream cached state stale.
+        """
+        self._snapshots = {
+            k: v for k, v in self._snapshots.items() if k < from_index
+        }
+
+    def clear_snapshots(self):
+        """Remove all cached snapshots."""
+        self._snapshots.clear()
 
     # -- Scrubbing -----------------------------------------------------------
 
