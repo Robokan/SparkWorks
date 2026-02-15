@@ -33,7 +33,7 @@ from .kernel.operations import (
     FilletOperation,
     ChamferOperation,
 )
-from .timeline import Timeline, Feature, FeatureType
+from .timeline import Timeline, Feature, FeatureType, SketchRegistry
 from .bridge import UsdBridge
 from .ui import CadToolbar, TimelinePanel, PropertyPanel, SketchViewport
 from .ui.sketch_tool import SketchToolManager, SketchToolMode
@@ -72,21 +72,20 @@ class ParametricCadExtension(omni.ext.IExt):
         self._ext_id = ext_id
 
         # -- Core systems ----
-        self._timeline = Timeline()
+        self._sketch_registry = SketchRegistry()
+        self._timeline = Timeline(sketch_registry=self._sketch_registry)
         self._bridge = UsdBridge()
         self._tessellator = Tessellator()
 
         # -- Construction planes ----
         self._construction_planes: List[ConstructionPlane] = create_origin_planes()
         self._plane_name_map: Dict[str, ConstructionPlane] = {}
-        self._selected_plane: Optional[ConstructionPlane] = None
         self._picking_plane: bool = False  # True when waiting for user to pick a plane
         self._last_stage_url: Optional[str] = None  # tracks current file for save-vs-open detection
 
         # -- Active sketch state ----
         self._active_sketch: Optional[Sketch] = None
         self._editing_feature_index: Optional[int] = None  # set when editing existing sketch
-        self._sketch_counter = 0
         self._feature_counter = 0
         self._body_counter = 0
         self._current_body_name = "Body1"
@@ -196,12 +195,12 @@ class ParametricCadExtension(omni.ext.IExt):
         if self._sketch_viewport:
             self._sketch_viewport.destroy()
         self._timeline = None
+        self._sketch_registry = None
         self._bridge = None
         self._active_sketch = None
         self._sketch_tool = None
         self._construction_planes = []
         self._plane_name_map = {}
-        self._selected_plane = None
         self._picking_plane = False
         self._face_planes = []
         self._face_plane_body = None
@@ -353,23 +352,33 @@ class ParametricCadExtension(omni.ext.IExt):
         self._load_timeline_from_usd()
 
     def _load_timeline_from_usd(self):
-        """Load timeline from USD prims if a saved timeline exists on the stage."""
+        """Load sketches + timeline from USD prims if saved data exists."""
         try:
+            # 1) Load sketches into the registry
+            loaded_registry = self._bridge.load_sketches()
+            if loaded_registry is not None:
+                self._sketch_registry = loaded_registry
+                self._timeline.sketch_registry = loaded_registry
+                print(f"[{EXTENSION_NAME}] Restored {loaded_registry.count} sketches from USD")
+
+            # 2) Load the timeline features (reference sketch IDs in the registry)
             features = self._bridge.load_timeline()
             if features and len(features) > 0:
                 from .timeline.timeline import Timeline
-                self._timeline = Timeline()
+                self._timeline = Timeline(sketch_registry=self._sketch_registry)
                 self._connect_timeline_callbacks()
                 for feature in features:
+                    feature.bind_registry(self._sketch_registry)
                     self._timeline._features.append(feature)
                 self._timeline._notify_changed()
-                # Rebuild to restore geometry
                 self._timeline.rebuild_all()
                 self._set_status(f"Restored {len(features)} features from saved stage")
                 _notify(f"Loaded {len(features)} features from stage.")
                 print(f"[{EXTENSION_NAME}] Restored {len(features)} features from USD")
         except Exception as e:
             print(f"[{EXTENSION_NAME}] No saved timeline to load (or error): {e}")
+            import traceback
+            traceback.print_exc()
 
     def _subscribe_selection_changed(self):
         """Subscribe to USD selection changes to detect plane clicks."""
@@ -536,7 +545,6 @@ class ParametricCadExtension(omni.ext.IExt):
 
         # 3) Reset everything to a clean state
         self._active_sketch = None
-        self._selected_plane = None
         self._picking_plane = False
         self._face_planes = []
         self._face_plane_body = None
@@ -547,13 +555,13 @@ class ParametricCadExtension(omni.ext.IExt):
         self._profile_sketch_name = None
         self._profile_feature_index = 0
         self._profile_plane_normal = None
-        self._sketch_counter = 0
         self._feature_counter = 0
         self._body_counter = 0
         self._current_body_name = "Body1"
 
-        # Reset the timeline and reconnect callbacks
-        self._timeline = Timeline()
+        # Reset the sketch registry and timeline; reconnect callbacks
+        self._sketch_registry = SketchRegistry()
+        self._timeline = Timeline(sketch_registry=self._sketch_registry)
         self._connect_timeline_callbacks()
 
         # Reset the UI panels
@@ -586,14 +594,9 @@ class ParametricCadExtension(omni.ext.IExt):
         except Exception:
             pass
 
-        # 7) Update feature/sketch counters from timeline
+        # 7) Update feature counter from timeline
         if self._timeline and self._timeline.features:
             self._feature_counter = len(self._timeline.features)
-            sketch_count = sum(
-                1 for f in self._timeline.features
-                if f.feature_type == FeatureType.SKETCH
-            )
-            self._sketch_counter = sketch_count
 
         # Remember the URL so we can distinguish Save from Open
         try:
@@ -645,7 +648,6 @@ class ParametricCadExtension(omni.ext.IExt):
 
     def _on_construction_plane_clicked(self, plane: ConstructionPlane):
         """Handle a click on a construction plane (origin or face)."""
-        self._selected_plane = plane
         # Track whether this is a face plane (for boolean join on extrude)
         if "_Face" in plane.name and self._face_plane_body:
             self._sketch_parent_body = self._face_plane_body
@@ -657,10 +659,10 @@ class ParametricCadExtension(omni.ext.IExt):
             self._picking_plane = False
             self._action_new_sketch_on_plane(plane)
         else:
-            # Not in picking mode — just select it for later
+            # Not in picking mode — just acknowledge the selection
             self._toolbar.set_plane_hint(f"Selected: {plane.name} — click Create Sketch")
-            self._set_status(f"Plane '{plane.name}' selected — click Create Sketch to begin")
-        print(f"[{EXTENSION_NAME}] Plane selected: {plane.name}")
+            self._set_status(f"Plane '{plane.name}' selected")
+        print(f"[{EXTENSION_NAME}] Plane clicked: {plane.name}")
 
     def _on_body_clicked(self, body_name: str):
         """
@@ -907,8 +909,9 @@ class ParametricCadExtension(omni.ext.IExt):
         """Create a new sketch on a specific ConstructionPlane."""
         self._picking_plane = False  # always exit picking mode
 
-        self._sketch_counter += 1
-        name = f"Sketch{self._sketch_counter}"
+        # The registry auto-generates the next name (Sketch1, Sketch2, …)
+        next_num = self._sketch_registry.counter + 1
+        name = f"Sketch{next_num}"
         self._active_sketch = Sketch(
             name=name,
             plane_name=plane.plane_type,
@@ -1054,30 +1057,60 @@ class ParametricCadExtension(omni.ext.IExt):
         """
         Handle the 'Create Sketch' button.
 
-        If a construction plane is already selected, use it immediately.
-        Otherwise enter picking mode so the user can click one.
+        Check if a construction plane is *currently* selected in the USD
+        viewport.  If so, use it immediately.  Otherwise enter picking
+        mode so the user can click one.
         """
-        if self._selected_plane is not None:
-            self._action_new_sketch_on_plane(self._selected_plane)
+        # Check if a construction plane is actively selected right now
+        currently_selected = self._get_currently_selected_plane()
+        if currently_selected is not None:
+            self._action_new_sketch_on_plane(currently_selected)
             return
 
-        # No plane selected — enter picking mode
+        # No plane actively selected — enter picking mode
         self._picking_plane = True
 
         # Unhide all body face planes and ensure they're in the lookup map
         self._bridge.set_all_face_planes_visible(True)
         self._register_all_face_planes()
 
-        self._set_status("Click a construction plane or a body face to start a sketch")
+        self._set_status("Select a construction plane or a body face")
         self._toolbar.set_plane_hint(
             "Click an origin plane or a body face"
         )
         self._focus_viewport()
 
+    def _get_currently_selected_plane(self) -> Optional[ConstructionPlane]:
+        """
+        Return the ConstructionPlane if the current USD selection is
+        exactly one construction plane prim.  Otherwise return None.
+
+        Also sets ``_sketch_parent_body`` when the selected plane is a
+        body face plane (needed for join-on-extrude).
+        """
+        try:
+            usd_context = omni.usd.get_context()
+            paths = usd_context.get_selection().get_selected_prim_paths()
+            if not paths or len(paths) != 1:
+                return None
+            prim_path = paths[0]
+            plane_name = self._bridge.is_construction_plane(prim_path)
+            if plane_name and plane_name in self._plane_name_map:
+                plane = self._plane_name_map[plane_name]
+                # Track body for join extrude
+                if "_Face" in plane.name and self._face_plane_body:
+                    self._sketch_parent_body = self._face_plane_body
+                else:
+                    self._sketch_parent_body = None
+                return plane
+        except Exception:
+            pass
+        return None
+
     def _action_new_sketch(self, plane_name: str = "XY"):
         """Legacy sketch creation from plane name string (fallback)."""
-        self._sketch_counter += 1
-        name = f"Sketch{self._sketch_counter}"
+        next_num = self._sketch_registry.counter + 1
+        name = f"Sketch{next_num}"
         self._active_sketch = Sketch(name=name, plane_name=plane_name)
         self._toolbar.set_sketch_mode(True)
         self._toolbar.set_plane_hint(f"Sketching on {plane_name}")
@@ -1112,10 +1145,15 @@ class ParametricCadExtension(omni.ext.IExt):
                 import traceback
                 traceback.print_exc()
         else:
-            # New sketch — insert at marker position
+            # New sketch — insert at marker position.
+            # Pass the sketch name as sketch_id so the registry uses it.
             try:
                 marker = self._timeline_panel.marker_position
-                self._timeline.add_sketch(finished_sketch, insert_after=marker)
+                self._timeline.add_sketch(
+                    finished_sketch,
+                    insert_after=marker,
+                    sketch_id=finished_sketch.name,
+                )
                 self._set_status(f"'{name}' added ({count} primitives) — ready for operations")
                 _notify(f"Sketch '{name}' added with {count} primitives.")
             except Exception as e:
@@ -1187,25 +1225,31 @@ class ParametricCadExtension(omni.ext.IExt):
 
         # Determine if this extrude should fuse with a parent body
         is_join = self._sketch_parent_body is not None
+        if is_join:
+            # Sketch-on-face: fuse into the same body, don't increment counter
+            target_body = self._sketch_parent_body
+        else:
+            # New body
+            self._body_counter += 1
+            target_body = f"Body{self._body_counter}"
+
         op = ExtrudeOperation(
             distance=dist,
             join=is_join,
+            body_name=target_body,
+            join_body_name=self._sketch_parent_body or "",
             profile_index=profile_idx,
             profile_indices=profile_indices,
         )
         op.name = f"Extrude{self._feature_counter}"
-        print(f"[{EXTENSION_NAME}] Extrude: distance={dist}, profile_indices={profile_indices}, join={is_join}")
+        self._current_body_name = target_body
+        print(f"[{EXTENSION_NAME}] Extrude: distance={dist}, body={target_body}, profile_indices={profile_indices}, join={is_join}")
 
         if is_join:
-            # Sketch-on-face: fuse into the same body, don't increment counter
-            self._current_body_name = self._sketch_parent_body
             self._set_status(
                 f"Extruding {dist} units (join onto {self._sketch_parent_body})..."
             )
         else:
-            # New body
-            self._body_counter += 1
-            self._current_body_name = f"Body{self._body_counter}"
             self._set_status(f"Extruding {dist} units...")
 
         marker = self._timeline_panel.marker_position
@@ -1277,13 +1321,12 @@ class ParametricCadExtension(omni.ext.IExt):
         self._set_status("Rebuild complete")
 
     def _action_clear_all(self):
-        self._timeline = Timeline()
+        self._sketch_registry = SketchRegistry()
+        self._timeline = Timeline(sketch_registry=self._sketch_registry)
         self._connect_timeline_callbacks()
         self._clear_profile_overlays()
         self._bridge.clear()
         self._active_sketch = None
-        self._selected_plane = None
-        self._sketch_counter = 0
         self._feature_counter = 0
         self._body_counter = 0
         self._current_body_name = "Body1"
@@ -1412,8 +1455,9 @@ class ParametricCadExtension(omni.ext.IExt):
     # Timeline Events -> Bridge + UI Updates
     # ========================================================================
 
-    def _on_timeline_rebuild(self, solid):
-        body_name = getattr(self, '_current_body_name', 'Body1')
+    def _on_timeline_rebuild(self, solid, bodies=None):
+        if bodies is None:
+            bodies = {}
 
         # Always clear ALL existing bodies first so stale geometry from
         # previous extrudes doesn't linger after inserts or reorders.
@@ -1424,12 +1468,24 @@ class ParametricCadExtension(omni.ext.IExt):
         except Exception:
             pass
 
-        if solid is not None:
-            prim_path = self._bridge.update_body_mesh(solid, body_name=body_name)
-            if prim_path:
-                print(f"[{EXTENSION_NAME}] Body '{body_name}' updated at {prim_path}")
-            # Re-create hidden face planes for the updated body
-            self._create_hidden_face_planes(body_name)
+        if bodies:
+            # Write each body from the bodies dict
+            for bname, bsolid in bodies.items():
+                if bsolid is not None:
+                    prim_path = self._bridge.update_body_mesh(bsolid, body_name=bname)
+                    if prim_path:
+                        print(f"[{EXTENSION_NAME}] Body '{bname}' updated at {prim_path}")
+                    self._create_hidden_face_planes(bname)
+            # Sync counters from the bodies dict
+            self._current_body_name = list(bodies.keys())[-1]
+            max_num = 0
+            for bname in bodies:
+                try:
+                    num = int(bname.replace("Body", ""))
+                    max_num = max(max_num, num)
+                except ValueError:
+                    pass
+            self._body_counter = max(self._body_counter, max_num)
         else:
             print(f"[{EXTENSION_NAME}] Rebuild produced no solid — all bodies cleared")
         self._timeline_panel.update_features(
@@ -1461,8 +1517,17 @@ class ParametricCadExtension(omni.ext.IExt):
             self._recreate_profile_overlays(saved_faces, saved_indices)
 
     def _save_timeline_to_usd(self):
-        """Save the current timeline features to USD prims."""
+        """Save both the sketch registry and timeline features to USD."""
         try:
+            # 1) Persist all sketches under /World/SparkWorks/Sketches/
+            self._bridge.save_sketches(self._sketch_registry)
+        except Exception as e:
+            print(f"[{EXTENSION_NAME}] Failed to save sketches to USD: {e}")
+            import traceback
+            traceback.print_exc()
+
+        try:
+            # 2) Persist the timeline (features with sketch_id references)
             features = self._timeline.features if self._timeline else []
             success = self._bridge.save_timeline(features)
             if not success:

@@ -33,6 +33,7 @@ CONSTRUCTION_SCOPE = "Construction"
 TIMELINE_SCOPE = "Timeline"
 BODIES_SCOPE = "Bodies"
 SETTINGS_SCOPE = "Settings"
+SKETCHES_SCOPE = "Sketches"
 DEFAULT_DISPLAY_COLOR = (0.7, 0.7, 0.8)  # Light steel blue
 
 # Default settings values
@@ -501,7 +502,7 @@ class UsdBridge:
         feature_index: int,
         plane_normal: Optional[Tuple[float, float, float]] = None,
         color: Tuple[float, float, float] = (0.2, 0.8, 0.4),
-        opacity: float = 0.35,
+        opacity: float = 0.15,
     ) -> List[str]:
         """
         Write semi-transparent profile meshes under the sketch's timeline
@@ -676,9 +677,9 @@ class UsdBridge:
         profile_paths: List[str],
         selected_idx: int,
         selected_color: Tuple[float, float, float] = (0.1, 0.6, 1.0),
-        selected_opacity: float = 0.55,
+        selected_opacity: float = 0.25,
         default_color: Tuple[float, float, float] = (0.2, 0.8, 0.4),
-        default_opacity: float = 0.35,
+        default_opacity: float = 0.15,
     ):
         """
         Highlight one profile and dim the others.
@@ -889,6 +890,95 @@ class UsdBridge:
         UsdGeom.SetStageMetersPerUnit(stage, cfg["meters_per_unit"])
         print(f"[SparkWorks] Applied stage metersPerUnit={cfg['meters_per_unit']} ({cfg['units']})")
 
+    # -- Sketches persistence (Fusion 360-style separate store) ---------------
+
+    @property
+    def sketches_root(self) -> str:
+        """USD path for the Sketches scope."""
+        return f"{self.root_path}/{SKETCHES_SCOPE}"
+
+    def save_sketches(self, sketch_registry) -> bool:
+        """
+        Write all sketches from the registry to USD under::
+
+            /World/SparkWorks/Sketches/
+                Sketch1/
+                    sparkworks:planeName = "XY"
+                    sparkworks:sketchName = "Sketch1"
+                    Primitives/
+                        Line_000/  ...
+                Sketch2/
+                    ...
+
+        The sketch data is independent of the timeline — just like
+        Fusion 360's Sketches folder.
+        """
+        if not USD_AVAILABLE:
+            return False
+
+        stage = self._get_stage()
+        if stage is None:
+            return False
+
+        self._ensure_root_scope(stage)
+
+        sk_path = self.sketches_root
+        sk_prim = stage.GetPrimAtPath(sk_path)
+        if sk_prim.IsValid():
+            stage.RemovePrim(sk_path)
+
+        UsdGeom.Xform.Define(stage, sk_path)
+        # Save the counter for name generation continuity
+        xf = stage.GetPrimAtPath(sk_path)
+        self._set_attr(xf, f"{NS}:counter", sketch_registry.counter, Sdf.ValueTypeNames.Int)
+
+        for sketch_id, sketch in sketch_registry.sketches.items():
+            safe_id = sketch_id.replace(" ", "_")
+            child_path = f"{sk_path}/{safe_id}"
+            xform = UsdGeom.Xform.Define(stage, child_path)
+            prim = xform.GetPrim()
+            # Reuse the existing _write_sketch_attrs to persist sketch data
+            self._write_sketch_attrs(stage, child_path, prim, sketch)
+            print(f"[SparkWorks] Wrote sketch '{sketch_id}' at {child_path}")
+
+        print(f"[SparkWorks] Sketches saved ({sketch_registry.count} sketches)")
+        return True
+
+    def load_sketches(self):
+        """
+        Read all sketches from USD and return a SketchRegistry.
+
+        Returns:
+            A SketchRegistry, or None if no sketches scope exists.
+        """
+        if not USD_AVAILABLE:
+            return None
+
+        stage = self._get_stage()
+        if stage is None:
+            return None
+
+        sk_prim = stage.GetPrimAtPath(self.sketches_root)
+        if not sk_prim.IsValid():
+            return None
+
+        from ..timeline.sketch_registry import SketchRegistry
+
+        registry = SketchRegistry()
+        counter_val = self._get_attr(sk_prim, f"{NS}:counter")
+        if counter_val is not None:
+            registry.counter = int(counter_val)
+
+        for child in sk_prim.GetChildren():
+            sketch_id = child.GetName()
+            sketch = self._read_sketch_from_prim(stage, child)
+            if sketch is not None:
+                registry._sketches[sketch_id] = sketch
+                print(f"[SparkWorks] Loaded sketch '{sketch_id}'")
+
+        print(f"[SparkWorks] Sketches loaded ({registry.count} sketches)")
+        return registry
+
     # -- Timeline persistence ------------------------------------------------
 
     @property
@@ -1010,8 +1100,15 @@ class UsdBridge:
         self._set_attr(prim, f"{NS}:suppressed", feature.suppressed, Sdf.ValueTypeNames.Bool)
         self._set_attr(prim, f"{NS}:createdAt", feature.created_at, Sdf.ValueTypeNames.Double)
 
-        if feature.feature_type == FeatureType.SKETCH and feature.sketch:
-            self._write_sketch_attrs(stage, prim_path, prim, feature.sketch)
+        if feature.feature_type == FeatureType.SKETCH:
+            # Sketch features now store only a sketch_id reference.
+            # The sketch data lives under /World/SparkWorks/Sketches/.
+            if feature.sketch_id:
+                self._set_attr(prim, f"{NS}:sketchId", feature.sketch_id, Sdf.ValueTypeNames.String)
+            # Also write inline sketch attrs for backward compat / quick access
+            sketch = feature.sketch  # resolves from registry
+            if sketch:
+                self._write_sketch_attrs(stage, prim_path, prim, sketch)
         elif feature.feature_type == FeatureType.OPERATION and feature.operation:
             self._write_operation_attrs(prim, feature.operation)
 
@@ -1099,6 +1196,8 @@ class UsdBridge:
             self._set_attr(prim, f"{NS}:both", operation.both, Sdf.ValueTypeNames.Bool)
             self._set_attr(prim, f"{NS}:negDistance", operation.neg_distance, Sdf.ValueTypeNames.Double)
             self._set_attr(prim, f"{NS}:join", operation.join, Sdf.ValueTypeNames.Bool)
+            self._set_attr(prim, f"{NS}:bodyName", operation.body_name, Sdf.ValueTypeNames.String)
+            self._set_attr(prim, f"{NS}:joinBodyName", operation.join_body_name, Sdf.ValueTypeNames.String)
             self._set_attr(prim, f"{NS}:profileIndex", operation.profile_index, Sdf.ValueTypeNames.Int)
             if operation.profile_indices:
                 self._set_attr(
@@ -1159,7 +1258,14 @@ class UsdBridge:
         )
 
         if feat_type == FeatureType.SKETCH:
-            feature.sketch = self._read_sketch_from_prim(stage, prim)
+            # Read the sketch_id reference (new architecture)
+            sketch_id = self._get_attr(prim, f"{NS}:sketchId")
+            if sketch_id:
+                feature.sketch_id = sketch_id
+            else:
+                # Backward compat: infer sketch_id from the sketch name
+                sketch_name = self._get_attr(prim, f"{NS}:sketchName") or name
+                feature.sketch_id = sketch_name
         elif feat_type == FeatureType.OPERATION:
             feature.operation = self._read_operation_from_prim(prim)
 
@@ -1297,6 +1403,8 @@ class UsdBridge:
                 both=_v(f"{NS}:both", False),
                 neg_distance=_v(f"{NS}:negDistance", 0.0),
                 join=_v(f"{NS}:join", False),
+                body_name=_v(f"{NS}:bodyName", ""),
+                join_body_name=_v(f"{NS}:joinBodyName", ""),
                 profile_index=_v(f"{NS}:profileIndex", 0),
                 profile_indices=profile_indices,
             )

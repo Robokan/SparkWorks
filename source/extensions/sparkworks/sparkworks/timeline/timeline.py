@@ -2,8 +2,11 @@
 Parametric Timeline — ordered feature history with rollback, edit, and rebuild.
 
 The Timeline holds an ordered list of Features. Each Feature wraps either a
-Sketch or a 3D Operation. When any feature's parameters change, the timeline
-rebuilds from that point forward, recomputing all downstream geometry.
+*reference* to a Sketch (by ID) or a 3D Operation. Sketch objects live in a
+separate **SketchRegistry** (like Fusion 360's Sketches folder).
+
+When any feature's parameters change, the timeline rebuilds from that point
+forward, recomputing all downstream geometry.
 
 This is the core data structure that makes the modeler "parametric."
 """
@@ -14,7 +17,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Callable, Dict, List, Optional, Any
+from typing import Callable, Dict, List, Optional, Any, TYPE_CHECKING
 
 from ..kernel.sketch import Sketch, primitive_from_dict
 from ..kernel.operations import (
@@ -23,6 +26,9 @@ from ..kernel.operations import (
     OperationContext,
     operation_from_dict,
 )
+
+if TYPE_CHECKING:
+    from .sketch_registry import SketchRegistry
 
 
 class FeatureType(Enum):
@@ -35,16 +41,39 @@ class Feature:
     """
     A single entry in the parametric timeline.
 
-    A feature is either a Sketch or an Operation (extrude, fillet, etc.).
+    A feature is either:
+    - **SKETCH** — holds a *sketch_id* that references a Sketch in the
+      SketchRegistry (the Sketch data itself lives in the registry, not
+      here — just like Fusion 360's Sketches folder).
+    - **OPERATION** — holds an operation object (extrude, fillet, …).
+
     Features form an ordered chain — each operation may depend on the
     sketch/solid from previous features.
     """
     name: str
     feature_type: FeatureType
-    sketch: Optional[Sketch] = None
+    sketch_id: Optional[str] = None  # references SketchRegistry
     operation: Optional[BaseOperation] = None
     suppressed: bool = False
     created_at: float = field(default_factory=time.time)
+
+    # ── Convenience property ------------------------------------------------
+    # The ``sketch`` property lets existing call-sites that read
+    # ``feature.sketch`` keep working transparently.  It requires a
+    # SketchRegistry to be attached via ``bind_registry()``.
+    _registry: Optional["SketchRegistry"] = field(
+        default=None, repr=False, compare=False,
+    )
+
+    def bind_registry(self, registry: "SketchRegistry"):
+        object.__setattr__(self, "_registry", registry)
+
+    @property
+    def sketch(self) -> Optional[Sketch]:
+        """Look up the Sketch from the registry.  Returns None if unbound."""
+        if self.sketch_id and self._registry:
+            return self._registry.get(self.sketch_id)
+        return None
 
     @property
     def display_name(self) -> str:
@@ -69,8 +98,8 @@ class Feature:
             "suppressed": self.suppressed,
             "created_at": self.created_at,
         }
-        if self.sketch:
-            d["sketch"] = self.sketch.to_dict()
+        if self.sketch_id:
+            d["sketch_id"] = self.sketch_id
         if self.operation:
             d["operation"] = self.operation.to_dict()
         return d
@@ -81,11 +110,10 @@ class Feature:
         feature = cls(
             name=d["name"],
             feature_type=feat_type,
+            sketch_id=d.get("sketch_id"),
             suppressed=d.get("suppressed", False),
             created_at=d.get("created_at", time.time()),
         )
-        if "sketch" in d:
-            feature.sketch = Sketch.from_dict(d["sketch"])
         if "operation" in d:
             feature.operation = operation_from_dict(d["operation"])
         return feature
@@ -108,16 +136,36 @@ class Timeline:
         on_feature_changed: Called when any feature is added/removed/modified.
     """
 
-    def __init__(self):
+    def __init__(self, sketch_registry: Optional["SketchRegistry"] = None):
         self._features: List[Feature] = []
         self._scrub_index: Optional[int] = None  # None = show latest
         self._current_solid = None
         self._current_sketch_face = None
         self._current_sketch_all_faces: list = []
 
+        # Dict of body_name -> solid for multi-body tracking.
+        # Each independent extrude creates a new entry; join extrudes
+        # update an existing entry.
+        self._bodies: Dict[str, Any] = {}
+
+        # The SketchRegistry that owns all Sketch objects.
+        # Features store only sketch_id; the registry resolves them.
+        self._sketch_registry: Optional["SketchRegistry"] = sketch_registry
+
         # Callbacks
         self.on_rebuild: Optional[Callable] = None
         self.on_feature_changed: Optional[Callable] = None
+
+    @property
+    def sketch_registry(self) -> Optional["SketchRegistry"]:
+        return self._sketch_registry
+
+    @sketch_registry.setter
+    def sketch_registry(self, registry: "SketchRegistry"):
+        self._sketch_registry = registry
+        # Bind existing features to the new registry
+        for f in self._features:
+            f.bind_registry(registry)
 
     # -- Properties ----------------------------------------------------------
 
@@ -133,6 +181,11 @@ class Timeline:
     def current_solid(self):
         """The solid at the current scrub position (or latest)."""
         return self._current_solid
+
+    @property
+    def bodies(self) -> Dict[str, Any]:
+        """Dict of body_name -> solid for all bodies at the current rebuild state."""
+        return dict(self._bodies)
 
     @property
     def scrub_index(self) -> int:
@@ -156,25 +209,38 @@ class Timeline:
     # -- Feature management --------------------------------------------------
 
     def add_sketch(self, sketch: Sketch, name: Optional[str] = None,
-                   insert_after: Optional[int] = None) -> Feature:
+                   insert_after: Optional[int] = None,
+                   sketch_id: Optional[str] = None) -> Feature:
         """
         Add a sketch feature to the timeline.
+
+        The Sketch object is registered in the SketchRegistry; the Feature
+        stores only a ``sketch_id`` reference — just like Fusion 360.
 
         Args:
             sketch: The Sketch object.
             name: Display name override.
             insert_after: If given, insert after this feature index
                           (-1 = before all features).  None = append at end.
+            sketch_id: Explicit registry ID.  Auto-generated if None.
         """
+        # Register the sketch in the central registry
+        if self._sketch_registry is not None:
+            sid = self._sketch_registry.register(sketch, sketch_id)
+        else:
+            sid = sketch_id or sketch.name
+
         feature = Feature(
-            name=name or sketch.name,
+            name=name or sid,
             feature_type=FeatureType.SKETCH,
-            sketch=sketch,
+            sketch_id=sid,
         )
+        feature.bind_registry(self._sketch_registry)
         idx = self._insert_feature(feature, insert_after)
-        self._scrub_index = None
+        # Place the marker right after the newly inserted feature
+        self._scrub_index = idx
         self._notify_changed()
-        self.rebuild_from(idx)
+        self.rebuild_from(0)
         return feature
 
     def add_operation(
@@ -196,9 +262,10 @@ class Timeline:
             operation=operation,
         )
         idx = self._insert_feature(feature, insert_after)
-        self._scrub_index = None
+        # Place the marker right after the newly inserted feature
+        self._scrub_index = idx
         self._notify_changed()
-        self.rebuild_from(idx)
+        self.rebuild_from(0)
         return feature
 
     def _insert_feature(self, feature: Feature, insert_after: Optional[int]) -> int:
@@ -221,7 +288,16 @@ class Timeline:
     def remove_feature(self, index: int):
         """Remove a feature and rebuild downstream."""
         if 0 <= index < len(self._features):
-            self._features.pop(index)
+            removed = self._features.pop(index)
+            # If we just removed a sketch feature, also remove it from the
+            # registry — unless another feature still references it.
+            if removed.sketch_id and self._sketch_registry:
+                still_used = any(
+                    f.sketch_id == removed.sketch_id
+                    for f in self._features
+                )
+                if not still_used:
+                    self._sketch_registry.remove(removed.sketch_id)
             rebuild_from = max(0, index - 1) if self._features else 0
             self._notify_changed()
             if self._features:
@@ -229,6 +305,7 @@ class Timeline:
             else:
                 self._current_solid = None
                 self._current_sketch_face = None
+                self._bodies = {}
                 self._notify_rebuild()
 
     def move_feature(self, from_index: int, to_index: int):
@@ -298,12 +375,14 @@ class Timeline:
             self._current_solid = None
             self._current_sketch_face = None
             self._current_sketch_all_faces = []
+            self._bodies = {}
         else:
-            # We'd need cached state at start_index - not implemented yet in Phase 1
+            # We'd need cached state at start_index - not implemented yet
             # For now, always rebuild from scratch
             self._current_solid = None
             self._current_sketch_face = None
             self._current_sketch_all_faces = []
+            self._bodies = {}
             start_index = 0
 
         context = OperationContext()
@@ -314,22 +393,23 @@ class Timeline:
             if feature.suppressed:
                 continue
 
-            if feature.is_sketch and feature.sketch:
-                # Build the sketch face — this becomes the profile for operations.
-                # Also cache all faces so operations can select a specific profile.
-                face = feature.sketch.build_face()
+            if feature.is_sketch and feature.sketch_id:
+                sketch = feature.sketch  # property resolves from registry
+                if sketch is None:
+                    print(f"[SparkWorks] WARNING: sketch '{feature.sketch_id}' not found in registry")
+                    continue
+                face = sketch.build_face()
                 self._current_sketch_face = face
-                self._current_sketch_all_faces = feature.sketch.build_all_faces()
+                self._current_sketch_all_faces = sketch.build_all_faces()
                 context.sketch_face = face
 
             elif feature.is_operation and feature.operation:
                 op = feature.operation
                 n_faces = len(self._current_sketch_all_faces) if self._current_sketch_all_faces else 0
 
-                # Determine which profile(s) to extrude
+                # Determine which profile(s) to use
                 pis = getattr(op, "profile_indices", [])
                 if not pis:
-                    # Backward compat: fall back to single profile_index
                     pis = [getattr(op, "profile_index", 0)]
 
                 if self._current_sketch_all_faces:
@@ -339,25 +419,31 @@ class Timeline:
                         if 0 <= pi < n_faces
                     ]
                     if selected:
-                        # Pass faces as a list — the operation will extrude
-                        # each one separately and fuse the resulting solids
                         context.sketch_faces = selected
                         context.sketch_face = selected[0]
-                        print(f"[SparkWorks] Using {len(selected)} profile(s) {pis} for '{feature.name}'")
                     else:
                         context.sketch_faces = []
                         context.sketch_face = self._current_sketch_face
-                        print(f"[SparkWorks] Fallback sketch face for '{feature.name}' (pis={pis}, n={n_faces})")
                 else:
                     context.sketch_faces = []
                     context.sketch_face = self._current_sketch_face
-                    print(f"[SparkWorks] Using default sketch face for '{feature.name}' (no all_faces)")
+
+                # Resolve join target from the bodies dict
+                body_name = getattr(op, "body_name", "")
+                join_body = getattr(op, "join_body_name", "")
+
+                if getattr(op, "join", False) and join_body:
+                    context.join_solid = self._bodies.get(join_body)
+                else:
+                    context.join_solid = None
 
                 context.current_solid = self._current_solid
-                # Pass the existing solid as join target for face-on-body extrudes
-                context.join_solid = self._current_solid
                 op.execute(context)
                 self._current_solid = context.current_solid
+
+                # Store the result in the bodies dict
+                if body_name and context.current_solid is not None:
+                    self._bodies[body_name] = context.current_solid
 
         self._notify_rebuild()
 
@@ -390,10 +476,12 @@ class Timeline:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Timeline":
-        timeline = cls()
+    def from_dict(cls, d: dict,
+                  sketch_registry: Optional["SketchRegistry"] = None) -> "Timeline":
+        timeline = cls(sketch_registry=sketch_registry)
         for feat_dict in d.get("features", []):
             feature = Feature.from_dict(feat_dict)
+            feature.bind_registry(sketch_registry)
             timeline._features.append(feature)
         timeline._scrub_index = d.get("scrub_index")
         return timeline
@@ -409,7 +497,7 @@ class Timeline:
 
     def _notify_rebuild(self):
         if self.on_rebuild:
-            self.on_rebuild(self._current_solid)
+            self.on_rebuild(self._current_solid, self._bodies)
 
     def _notify_changed(self):
         if self.on_feature_changed:

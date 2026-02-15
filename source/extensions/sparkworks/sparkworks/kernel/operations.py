@@ -90,6 +90,9 @@ class ExtrudeOperation(BaseOperation):
         neg_distance: Distance for the negative direction (used when both=True)
         join: If True, fuse the extruded solid with ``context.join_solid``
               (used when sketching on a body face).
+        body_name: The name of the body this extrusion creates or modifies
+              (e.g. "Body1").  Used during rebuild to track multiple bodies.
+        join_body_name: When ``join=True``, the body to fuse into.
         profile_index: Which profile (from ``Sketch.build_all_faces()``) to
               extrude when a sketch contains multiple extrudable regions.
               Kept for backward compatibility — prefer ``profile_indices``.
@@ -101,6 +104,8 @@ class ExtrudeOperation(BaseOperation):
     both: bool = False
     neg_distance: float = 0.0
     join: bool = False
+    body_name: str = ""
+    join_body_name: str = ""
     profile_index: int = 0
     profile_indices: List[int] = field(default_factory=list)
     op_type: OperationType = field(default=OperationType.EXTRUDE, init=False)
@@ -165,6 +170,8 @@ class ExtrudeOperation(BaseOperation):
             "both": self.both,
             "neg_distance": self.neg_distance,
             "join": self.join,
+            "body_name": self.body_name,
+            "join_body_name": self.join_body_name,
             "profile_index": self.profile_index,
             "suppressed": self.suppressed,
         }
@@ -180,6 +187,8 @@ class ExtrudeOperation(BaseOperation):
             both=d.get("both", False),
             neg_distance=d.get("neg_distance", 0.0),
             join=d.get("join", False),
+            body_name=d.get("body_name", ""),
+            join_body_name=d.get("join_body_name", ""),
             profile_index=d.get("profile_index", 0),
             profile_indices=d.get("profile_indices", []),
         )
