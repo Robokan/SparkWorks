@@ -28,6 +28,7 @@ from .kernel.construction_plane import (
     extract_face_planes,
 )
 from .kernel.operations import (
+    BooleanOperation,
     ExtrudeOperation,
     RevolveOperation,
     FilletOperation,
@@ -116,6 +117,8 @@ class ParametricCadExtension(omni.ext.IExt):
         # -- Dialog state ----
         self._extrude_dialog_window = None
         self._extrude_dist_model = None
+        self._boolean_dialog_window = None
+        self._boolean_pending_mode: str = "union"
 
         # -- UI ----
         self._toolbar = CadToolbar()
@@ -200,6 +203,9 @@ class ParametricCadExtension(omni.ext.IExt):
         if self._extrude_dialog_window:
             self._extrude_dialog_window.visible = False
             self._extrude_dialog_window = None
+        if self._boolean_dialog_window:
+            self._boolean_dialog_window.visible = False
+            self._boolean_dialog_window = None
         self._timeline = None
         self._sketch_registry = None
         self._bridge = None
@@ -237,6 +243,10 @@ class ParametricCadExtension(omni.ext.IExt):
         tb.on_revolve = self._action_revolve
         tb.on_fillet = self._action_fillet
         tb.on_chamfer = self._action_chamfer
+        # Boolean operations
+        tb.on_boolean_union = lambda: self._action_boolean("union")
+        tb.on_boolean_cut = lambda: self._action_boolean("cut")
+        tb.on_boolean_intersect = lambda: self._action_boolean("intersect")
         tb.on_rebuild_all = self._action_rebuild_all
         tb.on_clear_all = self._action_clear_all
 
@@ -274,9 +284,8 @@ class ParametricCadExtension(omni.ext.IExt):
         self._toolbar.set_status(msg)
 
     def _set_profile_selection(self, indices: set):
-        """Update selected profile indices and sync toolbar visibility."""
+        """Update selected profile indices."""
         self._selected_profile_indices = indices
-        self._toolbar.set_profiles_selected(bool(indices))
 
     def _update_sketch_view(self):
         """Push the current active sketch's primitives to the sketch viewport."""
@@ -478,59 +487,130 @@ class ParametricCadExtension(omni.ext.IExt):
         if not paths:
             return
 
-        # --- 1) Collect ALL selected profile overlays first --------------------
-        # This supports multi-select (Ctrl+click / Shift+click).  We mirror
-        # the USD selection directly: whatever profiles are selected in the
-        # stage tree IS the profile selection.
-        selected_profile_indices: List[int] = []
+        # ── Classify every selected path ──────────────────────────────
+        selected_profiles: List[int] = []
+        selected_face: Optional[str] = None
+        selected_bodies: List[str] = []
+        selected_sketch: Optional[str] = None
+        detected_sketch_name: Optional[str] = None
+        other_plane: Optional[ConstructionPlane] = None
+        tl_name: Optional[str] = None
+
+        sk_prefix = self._bridge.sketches_root + "/"
+
         for path in paths:
+            # Profile overlay
             profile_name = self._bridge.is_profile_prim(path)
             if profile_name:
                 try:
                     idx = int(profile_name.rsplit("Profile", 1)[-1])
-                    if idx < len(self._profile_faces):
-                        selected_profile_indices.append(idx)
+                    selected_profiles.append(idx)
+                    if detected_sketch_name is None and path.startswith(sk_prefix):
+                        detected_sketch_name = path[len(sk_prefix):].split("/")[0]
                 except (ValueError, IndexError):
                     pass
-
-        if selected_profile_indices:
-            self._set_profile_selection(set(selected_profile_indices))
-            sel = sorted(self._selected_profile_indices)
-            label = ", ".join(str(s) for s in sel)
-            self._set_status(f"Profile(s) {label} selected — click Extrude")
-            self._toolbar.set_plane_hint(f"Profile(s) {label} selected. Click Extrude.")
-            print(f"[{EXTENSION_NAME}] Profiles selected: {sel}")
-            return
-
-        # --- 2) Non-profile selections (check first path only) ----------------
-        for path in paths:
-            # Timeline feature (clicked in tree)
-            tl_name = self._bridge.is_timeline_prim(path)
-            if tl_name:
-                self._on_timeline_prim_clicked(tl_name)
-                return
-
-            # Origin / user construction plane
-            plane_name = self._bridge.is_construction_plane(path)
-            if plane_name and plane_name in self._construction_plane_map:
-                self._selected_face_name = None  # clear any face selection
-                plane = self._construction_plane_map[plane_name]
-                self._on_construction_plane_clicked(plane)
-                return
+                continue
 
             # Body face plane
             face_name = self._bridge.is_body_face(path)
             if face_name and face_name in self._face_map:
-                self._selected_face_name = face_name  # track for Extrude
-                plane = self._face_map[face_name]
-                self._on_construction_plane_clicked(plane)
-                return
+                selected_face = face_name
+                continue
 
             # Body mesh
             body_name = self._bridge.is_body_prim(path)
             if body_name:
-                self._on_body_clicked(body_name)
-                return
+                selected_bodies.append(body_name)
+                continue
+
+            # Sketch prim (the Sketch Xform itself or a child like Primitives)
+            if path.startswith(sk_prefix):
+                remainder = path[len(sk_prefix):]
+                sk_name = remainder.split("/")[0]
+                # Ignore Profiles children — those are handled above
+                if "/Profiles/" not in path:
+                    selected_sketch = sk_name
+                continue
+
+            # Timeline feature
+            tl = self._bridge.is_timeline_prim(path)
+            if tl:
+                tl_name = tl
+                continue
+
+            # Origin / user construction plane
+            plane_name = self._bridge.is_construction_plane(path)
+            if plane_name and plane_name in self._construction_plane_map:
+                other_plane = self._construction_plane_map[plane_name]
+                continue
+
+        # ── Act on classification ─────────────────────────────────────
+        # Hide all tool groups first; the matching branch re-shows the right one.
+        self._toolbar.set_sketch_tools_visible(False)
+        self._toolbar.set_op_tools_visible(False)
+        self._toolbar.set_bool_tools_visible(False)
+
+        # 1) Profile or face → extrude tools
+        if selected_profiles:
+            if not self._profile_faces and detected_sketch_name:
+                self._rebuild_profile_faces(detected_sketch_name)
+            self._selected_profile_indices = set(selected_profiles)
+            self._selected_face_name = None
+            self._toolbar.set_op_tools_visible(True)
+            sel = sorted(selected_profiles)
+            label = ", ".join(str(s) for s in sel)
+            self._set_status(f"Profile(s) {label} selected — click Extrude")
+            self._toolbar.set_plane_hint(f"Profile(s) {label} selected. Click Extrude.")
+            return
+
+        if selected_face:
+            self._selected_face_name = selected_face
+            self._selected_profile_indices = set()
+            self._toolbar.set_op_tools_visible(True)
+            plane = self._face_map[selected_face]
+            self._on_construction_plane_clicked(plane)
+            return
+
+        # 2) Sketch prim → sketch tools
+        if selected_sketch:
+            self._selected_face_name = None
+            self._selected_profile_indices = set()
+            sketch_obj = self._sketch_registry.get(selected_sketch) if self._sketch_registry else None
+            if sketch_obj:
+                self._active_sketch = sketch_obj
+                # Find the feature index for this sketch
+                for i, f in enumerate(self._timeline.features):
+                    if f.sketch_id == selected_sketch:
+                        self._editing_feature_index = i
+                        break
+                self._toolbar.set_sketch_mode(True)
+                self._toolbar.set_plane_hint(f"Editing '{selected_sketch}' — select a drawing tool")
+                self._bridge.hide_all_sketches(except_sketch=selected_sketch)
+                self._show_sketch_in_viewport(sketch_obj)
+                self._refresh_profile_overlays_for_active_sketch()
+                self._focus_sketch_view()
+            return
+
+        # 3) Body selected → boolean tools
+        if selected_bodies:
+            self._selected_face_name = None
+            self._selected_profile_indices = set()
+            if len(self._get_all_body_names()) >= 2:
+                self._toolbar.set_bool_tools_visible(True)
+            self._on_body_clicked(selected_bodies[0])
+            return
+
+        # 4) Everything else — timeline prim, construction plane, etc.
+        self._selected_face_name = None
+        self._selected_profile_indices = set()
+
+        if tl_name:
+            self._on_timeline_prim_clicked(tl_name)
+            return
+
+        if other_plane:
+            self._on_construction_plane_clicked(other_plane)
+            return
 
     async def _on_stage_opened(self):
         """Reload all SparkWorks state after a new stage is opened."""
@@ -736,6 +816,32 @@ class ParametricCadExtension(omni.ext.IExt):
     # multi-select (Ctrl+click).  The USD selection is mirrored into
     # self._selected_profile_indices.
 
+    def _rebuild_profile_faces(self, sketch_name: str):
+        """Rebuild cached _profile_faces from a sketch in the registry."""
+        try:
+            sketch = self._sketch_registry.get(sketch_name) if self._sketch_registry else None
+            if sketch is None:
+                print(f"[{EXTENSION_NAME}] Cannot rebuild profiles: sketch '{sketch_name}' not in registry")
+                return
+            faces = sketch.build_all_faces()
+            if faces:
+                self._profile_faces = faces
+                self._profile_sketch_name = sketch_name
+                # Also rebuild plane normal from the sketch
+                try:
+                    plane = sketch.plane
+                    n = plane.z_dir
+                    self._profile_plane_normal = (float(n.X), float(n.Y), float(n.Z))
+                except Exception:
+                    pass
+                # Collect existing profile prim paths from the stage
+                self._profile_paths = self._bridge.get_profile_paths(sketch_name)
+                print(f"[{EXTENSION_NAME}] Rebuilt {len(faces)} profile faces for '{sketch_name}'")
+        except Exception as e:
+            print(f"[{EXTENSION_NAME}] Error rebuilding profile faces: {e}")
+            import traceback
+            traceback.print_exc()
+
     def _recreate_profile_overlays(self, faces: list, selected_indices: set):
         """
         Re-create profile overlays.
@@ -895,8 +1001,7 @@ class ParametricCadExtension(omni.ext.IExt):
         Extract face planes from a body and create them as USD prims.
         Also registers them in ``_face_map`` so clicking them works.
         """
-        # Look up the specific body's solid — NOT current_solid, which
-        # is just the last solid the timeline touched.
+        # Look up the specific body's solid from the bodies dict.
         solid = self._timeline.bodies.get(body_name)
         if solid is None:
             return
@@ -1224,10 +1329,6 @@ class ParametricCadExtension(omni.ext.IExt):
         self._toolbar.set_plane_hint("Click a plane in the viewport to start a sketch")
         self._focus_viewport()
 
-        # Hide the finished sketch entirely (Fusion 360 style —
-        # both primitives and profiles are hidden once finished).
-        self._bridge.set_sketch_visible(finished_sketch.name, False)
-
         # ---- Profile detection & overlay ----
         # After returning to the viewport, detect and visualize closed
         # profiles from the sketch so they appear on the surface
@@ -1274,32 +1375,56 @@ class ParametricCadExtension(omni.ext.IExt):
         self._show_extrude_dialog()
 
     def _show_extrude_dialog(self):
-        """Pop up a small dialog to set the extrude distance, then execute."""
-        # Close any existing dialog first
+        """Pop up a small dialog to set the extrude distance and merge target."""
         if self._extrude_dialog_window:
             self._extrude_dialog_window.visible = False
             self._extrude_dialog_window = None
 
-        title = "Extrude Face" if self._selected_face_name else "Extrude"
+        is_face = bool(self._selected_face_name)
+        title = "Extrude Face" if is_face else "Extrude"
+
+        # Determine the source body (the body we're extruding from).
+        source_body = None
+        if is_face:
+            src_body, _ = self._parse_face_name(self._selected_face_name)
+            if src_body:
+                source_body = src_body
+        elif self._sketch_parent_body:
+            source_body = self._sketch_parent_body
+
+        # Merge options: "None" (new body) + the source body if applicable
+        merge_options = ["None"]
+        if source_body:
+            merge_options.append(source_body)
+
+        # Default: "None" unless this is a face extrude (merge is natural)
+        default_merge_idx = 0
+        if is_face and source_body:
+            default_merge_idx = merge_options.index(source_body)
+
         self._extrude_dialog_window = ui.Window(
-            title, width=300, height=120,
+            title, width=320, height=155,
         )
         self._extrude_dist_model = ui.SimpleFloatModel(10.0)
-
-        # Commit on Enter key in the float field
-        def _on_end_edit(model):
-            self._on_extrude_dialog_ok()
+        self._extrude_merge_options = merge_options
 
         with self._extrude_dialog_window.frame:
             with ui.VStack(spacing=6):
                 ui.Spacer(height=4)
                 with ui.HStack(height=24, spacing=4):
                     ui.Spacer(width=8)
-                    ui.Label("Distance:", width=65)
-                    field = ui.FloatField(
+                    ui.Label("Distance:", width=80)
+                    ui.FloatField(
                         model=self._extrude_dist_model, width=ui.Fraction(1),
                     )
-                    field.model.add_end_edit_fn(_on_end_edit)
+                    ui.Spacer(width=8)
+                with ui.HStack(height=24, spacing=4):
+                    ui.Spacer(width=8)
+                    ui.Label("Merge into:", width=80)
+                    self._extrude_merge_combo = ui.ComboBox(
+                        default_merge_idx, *merge_options,
+                        width=ui.Fraction(1),
+                    )
                     ui.Spacer(width=8)
                 ui.Spacer(height=4)
                 with ui.HStack(height=30, spacing=8):
@@ -1315,12 +1440,20 @@ class ParametricCadExtension(omni.ext.IExt):
     def _on_extrude_dialog_ok(self):
         dist = self._extrude_dist_model.as_float if self._extrude_dist_model else 10.0
 
+        # Read merge target from the combo box widget's own model
+        merge_idx = 0
+        combo = getattr(self, "_extrude_merge_combo", None)
+        if combo is not None:
+            merge_idx = combo.model.get_item_value_model().as_int
+        merge_options = getattr(self, "_extrude_merge_options", ["None"])
+        merge_target = merge_options[merge_idx] if merge_idx < len(merge_options) else "None"
+
         # Close the dialog
         if self._extrude_dialog_window:
             self._extrude_dialog_window.visible = False
             self._extrude_dialog_window = None
 
-        self._execute_extrude(dist)
+        self._execute_extrude(dist, merge_target=merge_target)
 
     def _on_extrude_dialog_cancel(self):
         if self._extrude_dialog_window:
@@ -1344,9 +1477,18 @@ class ParametricCadExtension(omni.ext.IExt):
         except (ValueError, IndexError):
             return (None, -1)
 
-    def _execute_extrude(self, dist: float):
-        """Perform the actual extrude operation with the given distance."""
+    def _execute_extrude(self, dist: float, merge_target: str = "None"):
+        """Perform the actual extrude operation with the given distance.
+
+        Args:
+            dist: Extrusion distance.
+            merge_target: ``"None"`` to create a fresh body, or the name
+                of an existing body to fuse into.
+        """
         self._feature_counter += 1
+
+        # Resolve merge intent from the dialog choice
+        is_merge = merge_target != "None"
 
         # ── Face-based extrude (Press/Pull) ──────────────────────────
         if self._selected_face_name:
@@ -1356,13 +1498,20 @@ class ParametricCadExtension(omni.ext.IExt):
                 _notify("Invalid face selection.", "warning")
                 return
 
-            # Always fuse with the source body (like Fusion 360 Press/Pull)
-            target_body = src_body
+            # Use the user's merge choice (default pre-selects the face's body)
+            if is_merge:
+                target_body = merge_target
+                join_body = merge_target
+            else:
+                self._body_counter += 1
+                target_body = f"Body{self._body_counter}"
+                join_body = ""
+
             op = ExtrudeOperation(
                 distance=dist,
-                join=True,
+                join=is_merge,
                 body_name=target_body,
-                join_body_name=src_body,
+                join_body_name=join_body,
                 face_body_name=src_body,
                 face_index=face_idx,
             )
@@ -1370,7 +1519,7 @@ class ParametricCadExtension(omni.ext.IExt):
             self._current_body_name = target_body
             print(
                 f"[{EXTENSION_NAME}] Face extrude: distance={dist}, "
-                f"face={self._selected_face_name}, body={target_body}"
+                f"face={self._selected_face_name}, body={target_body}, merge={is_merge}"
             )
             self._set_status(
                 f"Extruding face {face_idx} on '{src_body}' by {dist} units..."
@@ -1378,9 +1527,10 @@ class ParametricCadExtension(omni.ext.IExt):
 
             marker = self._timeline_panel.marker_position
             self._timeline.add_operation(op, name=op.name, insert_after=marker)
-            self._set_status(
-                f"Extrude (d={dist}) fused onto {src_body}"
-            )
+            if is_merge:
+                self._set_status(f"Extrude (d={dist}) fused onto {target_body}")
+            else:
+                self._set_status(f"Extrude (d={dist}) — {target_body} created")
             self._selected_face_name = None  # consumed
 
         # ── Sketch-profile-based extrude ─────────────────────────────
@@ -1388,18 +1538,19 @@ class ParametricCadExtension(omni.ext.IExt):
             profile_indices = sorted(self._selected_profile_indices) if self._selected_profile_indices else [0]
             profile_idx = profile_indices[0] if profile_indices else 0
 
-            is_join = self._sketch_parent_body is not None
-            if is_join:
-                target_body = self._sketch_parent_body
+            if is_merge:
+                target_body = merge_target
+                join_body = merge_target
             else:
                 self._body_counter += 1
                 target_body = f"Body{self._body_counter}"
+                join_body = ""
 
             op = ExtrudeOperation(
                 distance=dist,
-                join=is_join,
+                join=is_merge,
                 body_name=target_body,
-                join_body_name=self._sketch_parent_body or "",
+                join_body_name=join_body,
                 profile_index=profile_idx,
                 profile_indices=profile_indices,
             )
@@ -1407,12 +1558,12 @@ class ParametricCadExtension(omni.ext.IExt):
             self._current_body_name = target_body
             print(
                 f"[{EXTENSION_NAME}] Extrude: distance={dist}, body={target_body}, "
-                f"profile_indices={profile_indices}, join={is_join}"
+                f"profile_indices={profile_indices}, merge={is_merge}"
             )
 
-            if is_join:
+            if is_merge:
                 self._set_status(
-                    f"Extruding {dist} units (join onto {self._sketch_parent_body})..."
+                    f"Extruding {dist} units (merge into {target_body})..."
                 )
             else:
                 self._set_status(f"Extruding {dist} units...")
@@ -1420,14 +1571,14 @@ class ParametricCadExtension(omni.ext.IExt):
             marker = self._timeline_panel.marker_position
             self._timeline.add_operation(op, name=op.name, insert_after=marker)
 
-            if is_join:
+            if is_merge:
                 self._set_status(
-                    f"Extrude (d={dist}) joined to {self._sketch_parent_body}"
+                    f"Extrude (d={dist}) merged into {target_body}"
                 )
                 self._sketch_parent_body = None
             else:
                 self._set_status(
-                    f"Extrude (d={dist}) complete — {self._current_body_name} created"
+                    f"Extrude (d={dist}) complete — {target_body} created"
                 )
 
         # Select the newly created/updated body in the viewport
@@ -1448,37 +1599,227 @@ class ParametricCadExtension(omni.ext.IExt):
             return
         angle = self._toolbar.revolve_angle
         self._feature_counter += 1
-        op = RevolveOperation(angle=angle, axis_name="Z")
+        self._body_counter += 1
+        body_name = f"Body{self._body_counter}"
+        op = RevolveOperation(angle=angle, axis_name="Z", body_name=body_name)
         op.name = f"Revolve{self._feature_counter}"
+        self._current_body_name = body_name
         marker = self._timeline_panel.marker_position
         self._timeline.add_operation(op, name=op.name, insert_after=marker)
-        self._set_status(f"Revolve ({angle}) complete")
+        self._set_status(f"Revolve ({angle}) complete — {body_name} created")
+
+    def _get_selected_body_names(self) -> List[str]:
+        """Return the names of all currently selected bodies in the stage."""
+        selected = []
+        try:
+            usd_context = omni.usd.get_context()
+            paths = usd_context.get_selection().get_selected_prim_paths()
+            all_bodies = self._get_all_body_names()
+            for path in (paths or []):
+                body_name = self._bridge.is_body_prim(path)
+                if body_name and body_name in all_bodies:
+                    selected.append(body_name)
+        except Exception:
+            pass
+        return selected
+
+    def _get_selected_body_name(self) -> Optional[str]:
+        """Return the name of the first currently selected body, or fallback to last body."""
+        selected = self._get_selected_body_names()
+        if selected:
+            return selected[0]
+        bodies = self._get_all_body_names()
+        if bodies:
+            return bodies[-1]
+        return None
+
+    def _get_all_body_names(self) -> List[str]:
+        """Authoritative list of body names from USD stage, falling back to timeline."""
+        try:
+            names = self._bridge.get_body_names()
+            if names:
+                return names
+        except Exception:
+            pass
+        return list(self._timeline.bodies.keys())
 
     def _action_fillet(self):
-        if self._timeline.current_solid is None:
-            self._set_status("Create a 3D solid first (sketch + extrude)")
-            _notify("Create a 3D solid first.", "warning")
+        body_name = self._get_selected_body_name()
+        if not body_name:
+            self._set_status("Select a body first (or create one with sketch + extrude)")
+            _notify("Select a body first.", "warning")
             return
         radius = self._toolbar.fillet_radius
         self._feature_counter += 1
-        op = FilletOperation(radius=radius)
+        op = FilletOperation(radius=radius, body_name=body_name)
         op.name = f"Fillet{self._feature_counter}"
         marker = self._timeline_panel.marker_position
         self._timeline.add_operation(op, name=op.name, insert_after=marker)
-        self._set_status(f"Fillet (r={radius}) applied")
+        self._set_status(f"Fillet (r={radius}) applied to {body_name}")
 
     def _action_chamfer(self):
-        if self._timeline.current_solid is None:
-            self._set_status("Create a 3D solid first (sketch + extrude)")
-            _notify("Create a 3D solid first.", "warning")
+        body_name = self._get_selected_body_name()
+        if not body_name:
+            self._set_status("Select a body first (or create one with sketch + extrude)")
+            _notify("Select a body first.", "warning")
             return
         length = self._toolbar.chamfer_length
         self._feature_counter += 1
-        op = ChamferOperation(length=length)
+        op = ChamferOperation(length=length, body_name=body_name)
         op.name = f"Chamfer{self._feature_counter}"
         marker = self._timeline_panel.marker_position
         self._timeline.add_operation(op, name=op.name, insert_after=marker)
-        self._set_status(f"Chamfer (l={length}) applied")
+        self._set_status(f"Chamfer (l={length}) applied to {body_name}")
+
+    # -- Boolean operations ----------------------------------------------------
+
+    def _action_boolean(self, mode: str):
+        """
+        Start a boolean merge.  Requires at least 2 bodies.
+        Opens a dialog to choose target and tool bodies.
+        """
+        body_names = self._get_all_body_names()
+        if len(body_names) < 2:
+            self._set_status("Need at least 2 bodies for a boolean operation")
+            _notify("Need at least 2 bodies for a boolean operation.", "warning")
+            return
+
+        self._boolean_pending_mode = mode
+        self._show_boolean_dialog(mode, body_names)
+
+    def _show_boolean_dialog(self, mode: str, body_names: list):
+        """Pop up a dialog with two combo boxes for target/tool body."""
+        if self._boolean_dialog_window:
+            self._boolean_dialog_window.visible = False
+            self._boolean_dialog_window = None
+
+        title_map = {"union": "Boolean Union", "cut": "Boolean Cut", "intersect": "Boolean Intersect"}
+        title = title_map.get(mode, "Boolean")
+
+        self._boolean_dialog_window = ui.Window(
+            title, width=340, height=180,
+        )
+
+        # Add "None" as the first option so no body is pre-selected by default.
+        combo_items = ["None"] + body_names
+        self._boolean_combo_items = combo_items
+
+        # Pre-select from the current USD stage selection if the user
+        # has multi-selected bodies; otherwise both default to "None" (idx 0).
+        selected = self._get_selected_body_names()
+
+        target_default = 0
+        tool_default = 0
+        if len(selected) >= 2:
+            if selected[0] in combo_items:
+                target_default = combo_items.index(selected[0])
+            if selected[1] in combo_items:
+                tool_default = combo_items.index(selected[1])
+        elif len(selected) == 1:
+            if selected[0] in combo_items:
+                target_default = combo_items.index(selected[0])
+
+        with self._boolean_dialog_window.frame:
+            with ui.VStack(spacing=6):
+                ui.Spacer(height=4)
+                with ui.HStack(height=24, spacing=4):
+                    ui.Spacer(width=8)
+                    ui.Label("Target body:", width=90)
+                    self._boolean_target_combo = ui.ComboBox(
+                        target_default, *combo_items, width=ui.Fraction(1))
+                    ui.Spacer(width=8)
+                with ui.HStack(height=24, spacing=4):
+                    ui.Spacer(width=8)
+                    ui.Label("Tool body:", width=90)
+                    self._boolean_tool_combo = ui.ComboBox(
+                        tool_default, *combo_items, width=ui.Fraction(1))
+                    ui.Spacer(width=8)
+                with ui.HStack(height=24, spacing=4):
+                    ui.Spacer(width=8)
+                    ui.Label("Keep tool:", width=90)
+                    self._boolean_keep_tool_model = ui.SimpleBoolModel(False)
+                    ui.CheckBox(model=self._boolean_keep_tool_model, width=24)
+                    ui.Spacer(width=ui.Fraction(1))
+                    ui.Spacer(width=8)
+                with ui.HStack(height=28, spacing=8):
+                    ui.Spacer(width=8)
+                    ui.Button("OK", width=ui.Fraction(1),
+                              clicked_fn=self._on_boolean_dialog_ok,
+                              style={"Button": {"background_color": 0xFF3A7D44}})
+                    ui.Button("Cancel", width=ui.Fraction(1),
+                              clicked_fn=self._on_boolean_dialog_cancel)
+                    ui.Spacer(width=8)
+                ui.Spacer(height=4)
+
+    def _on_boolean_dialog_ok(self):
+        mode = self._boolean_pending_mode
+        combo_items = getattr(self, "_boolean_combo_items", [])
+        keep_tool = self._boolean_keep_tool_model.as_bool
+
+        # Read selections from the combo box widgets
+        target_idx = 0
+        tool_idx = 0
+        target_combo = getattr(self, "_boolean_target_combo", None)
+        tool_combo = getattr(self, "_boolean_tool_combo", None)
+        if target_combo is not None:
+            target_idx = target_combo.model.get_item_value_model().as_int
+        if tool_combo is not None:
+            tool_idx = tool_combo.model.get_item_value_model().as_int
+
+        # Close the dialog
+        if self._boolean_dialog_window:
+            self._boolean_dialog_window.visible = False
+            self._boolean_dialog_window = None
+
+        # Validate selections — "None" (idx 0) is not a valid body
+        if target_idx <= 0 or target_idx >= len(combo_items):
+            self._set_status("Select a target body")
+            _notify("Select a target body.", "warning")
+            return
+        if tool_idx <= 0 or tool_idx >= len(combo_items):
+            self._set_status("Select a tool body")
+            _notify("Select a tool body.", "warning")
+            return
+        if target_idx == tool_idx:
+            self._set_status("Target and tool body must be different")
+            _notify("Target and tool body must be different.", "warning")
+            return
+
+        target_name = combo_items[target_idx]
+        tool_name = combo_items[tool_idx]
+
+        self._execute_boolean(mode, target_name, tool_name, keep_tool)
+
+    def _on_boolean_dialog_cancel(self):
+        if self._boolean_dialog_window:
+            self._boolean_dialog_window.visible = False
+            self._boolean_dialog_window = None
+
+    def _execute_boolean(self, mode: str, target_body: str, tool_body: str, keep_tool: bool = False):
+        """Perform the actual boolean operation."""
+        self._feature_counter += 1
+        op = BooleanOperation(
+            mode=mode,
+            target_body=target_body,
+            tool_body=tool_body,
+            keep_tool=keep_tool,
+        )
+        op.name = f"Boolean{self._feature_counter}"
+
+        marker = self._timeline_panel.marker_position
+        self._timeline.add_operation(op, name=op.name, insert_after=marker)
+
+        # Select the result body in the stage
+        result_path = self._bridge.bodies_root + "/" + target_body
+        try:
+            import omni.usd
+            ctx = omni.usd.get_context()
+            if ctx:
+                ctx.get_selection().set_selected_prim_paths([result_path], True)
+        except Exception:
+            pass
+
+        self._set_status(f"Boolean {mode}: {target_body} {mode} {tool_body}")
 
     def _action_rebuild_all(self):
         self._set_status("Rebuilding...")
@@ -1579,7 +1920,6 @@ class ParametricCadExtension(omni.ext.IExt):
         if position < 0:
             # Before all features — clear geometry
             self._timeline._scrub_index = -1
-            self._timeline._current_solid = None
             self._timeline._bodies = {}
             self._timeline._current_sketch_face = None
             self._timeline._notify_rebuild()
@@ -1640,7 +1980,7 @@ class ParametricCadExtension(omni.ext.IExt):
     # Timeline Events -> Bridge + UI Updates
     # ========================================================================
 
-    def _on_timeline_rebuild(self, solid, bodies=None):
+    def _on_timeline_rebuild(self, bodies=None):
         if bodies is None:
             bodies = {}
 
@@ -1678,6 +2018,9 @@ class ParametricCadExtension(omni.ext.IExt):
             marker_pos=self._timeline.scrub_index,
             selected_idx=self._timeline_panel.selected_index,
         )
+
+        # Toolbar visibility is driven by USD selection — no need to
+        # force-show/hide tool groups here.
 
     def _on_features_changed(self, features):
         try:

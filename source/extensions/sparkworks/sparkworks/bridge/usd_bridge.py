@@ -495,6 +495,19 @@ class UsdBridge:
         safe_name = sketch_name.replace(" ", "_")
         return f"{self.sketches_root}/{safe_name}/{self.PROFILES_CHILD}"
 
+    def get_profile_paths(self, sketch_name: str) -> List[str]:
+        """Return the USD paths of all profile prims under the given sketch."""
+        if not USD_AVAILABLE:
+            return []
+        stage = self._get_stage()
+        if stage is None:
+            return []
+        profiles_root = self._sketch_profiles_path(sketch_name)
+        profiles_prim = stage.GetPrimAtPath(profiles_root)
+        if not profiles_prim.IsValid():
+            return []
+        return [str(child.GetPath()) for child in profiles_prim.GetChildren()]
+
     def create_profile_overlays(
         self,
         faces: list,

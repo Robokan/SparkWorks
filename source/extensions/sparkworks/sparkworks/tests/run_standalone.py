@@ -127,7 +127,7 @@ class TestExtrude(unittest.TestCase):
         self.assertEqual(body, "Body1")
         self.assertEqual(len(self.api.bodies), 1)
         self.assertIn("Body1", self.api.bodies)
-        self.assertIsNotNone(self.api.current_solid)
+        self.assertIsNotNone(self.api.get_body_solid("Body1"))
 
     def test_extrude_produces_solid(self):
         self._make_box()
@@ -175,7 +175,7 @@ class TestExtrude(unittest.TestCase):
         self.api.add_rectangle(sk, 10, 10)
         self.api.finish_sketch(sk)
         self.api.extrude(distance=10, symmetric=True)
-        self.assertIsNotNone(self.api.current_solid)
+        self.assertGreater(len(self.api.bodies), 0)
 
     def test_three_independent_bodies(self):
         for i in range(3):
@@ -199,7 +199,7 @@ class TestOtherOps(unittest.TestCase):
         self.api.add_rectangle(sk, 5, 2, center=(10, 0))
         self.api.finish_sketch(sk)
         self.api.revolve(angle=360, axis="Z")
-        self.assertIsNotNone(self.api.current_solid)
+        self.assertGreater(len(self.api.bodies), 0)
 
     def test_fillet(self):
         sk = self.api.create_sketch("XY")
@@ -207,7 +207,7 @@ class TestOtherOps(unittest.TestCase):
         self.api.finish_sketch(sk)
         self.api.extrude(distance=5)
         self.api.fillet(radius=0.5)
-        self.assertIsNotNone(self.api.current_solid)
+        self.assertIsNotNone(self.api.get_body_solid("Body1"))
         self.assertEqual(self.api.feature_count, 3)
 
     def test_chamfer(self):
@@ -216,7 +216,7 @@ class TestOtherOps(unittest.TestCase):
         self.api.finish_sketch(sk)
         self.api.extrude(distance=5)
         self.api.chamfer(length=0.5)
-        self.assertIsNotNone(self.api.current_solid)
+        self.assertIsNotNone(self.api.get_body_solid("Body1"))
         self.assertEqual(self.api.feature_count, 3)
 
 
@@ -357,6 +357,81 @@ class TestInsertAtMarker(unittest.TestCase):
         self.api.finish_sketch(sk3)
         self.api.extrude(distance=3)
         self.assertEqual(self.api.feature_count, 6)
+
+
+class TestBoolean(unittest.TestCase):
+    """Boolean body merge operations."""
+
+    def setUp(self):
+        self.api = SparkWorksAPI(use_bridge=False)
+        # Two overlapping boxes
+        sk1 = self.api.create_sketch("XY")
+        self.api.add_rectangle(sk1, 20, 20, center=(0, 0))
+        self.api.finish_sketch(sk1)
+        self.api.extrude(distance=10)
+
+        sk2 = self.api.create_sketch("XY")
+        self.api.add_rectangle(sk2, 10, 10, center=(5, 5))
+        self.api.finish_sketch(sk2)
+        self.api.extrude(distance=15)
+
+    def test_two_bodies_exist(self):
+        self.assertEqual(len(self.api.bodies), 2)
+
+    def test_boolean_union(self):
+        result = self.api.boolean_union("Body1", "Body2")
+        self.assertEqual(result, "Body1")
+        self.assertNotIn("Body2", self.api.bodies)
+        self.assertIsNotNone(self.api.bodies["Body1"])
+
+    def test_boolean_cut(self):
+        result = self.api.boolean_cut("Body1", "Body2")
+        self.assertEqual(result, "Body1")
+        self.assertNotIn("Body2", self.api.bodies)
+
+    def test_boolean_intersect(self):
+        result = self.api.boolean_intersect("Body1", "Body2")
+        self.assertEqual(result, "Body1")
+        self.assertNotIn("Body2", self.api.bodies)
+
+    def test_boolean_keep_tool(self):
+        self.api.boolean_union("Body1", "Body2", keep_tool=True)
+        self.assertIn("Body1", self.api.bodies)
+        self.assertIn("Body2", self.api.bodies)
+
+    def test_boolean_same_body_raises(self):
+        with self.assertRaises(ValueError):
+            self.api.boolean_union("Body1", "Body1")
+
+    def test_boolean_missing_body_raises(self):
+        with self.assertRaises(ValueError):
+            self.api.boolean_union("Body1", "BodyX")
+
+    def test_boolean_timeline_feature_count(self):
+        count_before = self.api.feature_count
+        self.api.boolean_union("Body1", "Body2")
+        self.assertEqual(self.api.feature_count, count_before + 1)
+
+    def test_boolean_scrub_roundtrip(self):
+        self.api.boolean_cut("Body1", "Body2")
+        self.api.scrub_to_start()
+        self.assertEqual(len(self.api.bodies), 0)
+        self.api.scrub_to_end()
+        self.assertIn("Body1", self.api.bodies)
+        self.assertNotIn("Body2", self.api.bodies)
+
+    def test_boolean_chain(self):
+        """Union then cut with a third body."""
+        sk3 = self.api.create_sketch("XY")
+        self.api.add_rectangle(sk3, 5, 5, center=(-5, -5))
+        self.api.finish_sketch(sk3)
+        self.api.extrude(distance=8)
+
+        self.api.boolean_union("Body1", "Body2")
+        self.assertEqual(len(self.api.bodies), 2)
+
+        self.api.boolean_cut("Body1", "Body3")
+        self.assertEqual(len(self.api.bodies), 1)
 
 
 class TestEdgeCases(unittest.TestCase):

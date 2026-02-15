@@ -23,7 +23,10 @@ from ..kernel.sketch import Sketch, primitive_from_dict
 from ..kernel.construction_plane import get_planar_face
 from ..kernel.operations import (
     BaseOperation,
+    BooleanOperation,
+    ChamferOperation,
     ExtrudeOperation,
+    FilletOperation,
     OperationContext,
     operation_from_dict,
 )
@@ -133,18 +136,18 @@ class Timeline:
     - Serialization to/from dicts (for USD attribute storage)
 
     Callbacks:
-        on_rebuild: Called after a rebuild with the resulting solid.
+        on_rebuild: Called after a rebuild with the bodies dict.
         on_feature_changed: Called when any feature is added/removed/modified.
     """
 
     def __init__(self, sketch_registry: Optional["SketchRegistry"] = None):
         self._features: List[Feature] = []
         self._scrub_index: Optional[int] = None  # None = show latest
-        self._current_solid = None
         self._current_sketch_face = None
         self._current_sketch_all_faces: list = []
 
         # Dict of body_name -> solid for multi-body tracking.
+        # This is the single source of truth for all body geometry.
         # Each independent extrude creates a new entry; join extrudes
         # update an existing entry.
         self._bodies: Dict[str, Any] = {}
@@ -183,11 +186,6 @@ class Timeline:
     @property
     def feature_count(self) -> int:
         return len(self._features)
-
-    @property
-    def current_solid(self):
-        """The solid at the current scrub position (or latest)."""
-        return self._current_solid
 
     @property
     def bodies(self) -> Dict[str, Any]:
@@ -313,7 +311,6 @@ class Timeline:
             if self._features:
                 self.rebuild_from(rebuild_from)
             else:
-                self._current_solid = None
                 self._current_sketch_face = None
                 self._bodies = {}
                 self._snapshots.clear()
@@ -419,7 +416,6 @@ class Timeline:
 
         # ── Fresh start (no usable snapshot) ────────────────────────
         if not restored:
-            self._current_solid = None
             self._current_sketch_face = None
             self._current_sketch_all_faces = []
             self._bodies = {}
@@ -451,61 +447,94 @@ class Timeline:
             elif feature.is_operation and feature.operation:
                 op = feature.operation
 
-                # ── Face-based extrude (Press/Pull) ──────────────────
-                face_body = getattr(op, "face_body_name", "")
-                face_idx = getattr(op, "face_index", -1)
+                # ── Boolean body merge (union / cut / intersect) ─────
+                if isinstance(op, BooleanOperation):
+                    target_solid = self._bodies.get(op.target_body)
+                    tool_solid = self._bodies.get(op.tool_body)
 
-                if face_body and face_idx >= 0:
-                    # Resolve the face directly from the body solid
-                    src_solid = self._bodies.get(face_body)
-                    face = get_planar_face(src_solid, face_idx) if src_solid else None
-                    if face is not None:
-                        context.sketch_face = face
-                        context.sketch_faces = [face]
+                    if target_solid is None:
+                        print(f"[SparkWorks] Boolean: target body '{op.target_body}' not found")
+                    elif tool_solid is None:
+                        print(f"[SparkWorks] Boolean: tool body '{op.tool_body}' not found")
                     else:
-                        print(f"[SparkWorks] WARNING: could not resolve face {face_idx} on '{face_body}'")
-                        context.sketch_face = None
-                        context.sketch_faces = []
+                        context.current_solid = target_solid
+                        context.join_solid = tool_solid
+                        op.execute(context)
+
+                        if context.current_solid is not None:
+                            self._bodies[op.target_body] = context.current_solid
+                            # Remove tool body (consumed) unless keep_tool
+                            if not op.keep_tool and op.tool_body in self._bodies:
+                                del self._bodies[op.tool_body]
+
+                # ── Fillet / Chamfer (modify a named body in-place) ───
+                elif isinstance(op, (FilletOperation, ChamferOperation)):
+                    body_name = op.body_name
+                    target = self._bodies.get(body_name) if body_name else None
+                    if target is None:
+                        print(f"[SparkWorks] {op.op_type.name}: body '{body_name}' not found")
+                    else:
+                        context.current_solid = target
+                        op.execute(context)
+                        if context.current_solid is not None:
+                            self._bodies[body_name] = context.current_solid
+
+                # ── Extrude / Revolve ─────────────────────────────────
                 else:
-                    # ── Sketch-profile-based extrude ─────────────────
-                    n_faces = len(self._current_sketch_all_faces) if self._current_sketch_all_faces else 0
+                    # ── Face-based extrude (Press/Pull) ──────────────────
+                    face_body = getattr(op, "face_body_name", "")
+                    face_idx = getattr(op, "face_index", -1)
 
-                    pis = getattr(op, "profile_indices", [])
-                    if not pis:
-                        pis = [getattr(op, "profile_index", 0)]
+                    if face_body and face_idx >= 0:
+                        src_solid = self._bodies.get(face_body)
+                        face = get_planar_face(src_solid, face_idx) if src_solid else None
+                        if face is not None:
+                            context.sketch_face = face
+                            context.sketch_faces = [face]
+                        else:
+                            print(f"[SparkWorks] WARNING: could not resolve face {face_idx} on '{face_body}'")
+                            context.sketch_face = None
+                            context.sketch_faces = []
+                    else:
+                        # ── Sketch-profile-based extrude ─────────────────
+                        n_faces = len(self._current_sketch_all_faces) if self._current_sketch_all_faces else 0
 
-                    if self._current_sketch_all_faces:
-                        selected = [
-                            self._current_sketch_all_faces[pi]
-                            for pi in pis
-                            if 0 <= pi < n_faces
-                        ]
-                        if selected:
-                            context.sketch_faces = selected
-                            context.sketch_face = selected[0]
+                        pis = getattr(op, "profile_indices", [])
+                        if not pis:
+                            pis = [getattr(op, "profile_index", 0)]
+
+                        if self._current_sketch_all_faces:
+                            selected = [
+                                self._current_sketch_all_faces[pi]
+                                for pi in pis
+                                if 0 <= pi < n_faces
+                            ]
+                            if selected:
+                                context.sketch_faces = selected
+                                context.sketch_face = selected[0]
+                            else:
+                                context.sketch_faces = []
+                                context.sketch_face = self._current_sketch_face
                         else:
                             context.sketch_faces = []
                             context.sketch_face = self._current_sketch_face
+
+                    # Resolve join target from the bodies dict
+                    body_name = getattr(op, "body_name", "")
+                    join_body = getattr(op, "join_body_name", "")
+                    is_join = getattr(op, "join", False) and join_body
+
+                    if is_join:
+                        context.join_solid = self._bodies.get(join_body)
+                        context.current_solid = self._bodies.get(join_body)
                     else:
-                        context.sketch_faces = []
-                        context.sketch_face = self._current_sketch_face
+                        context.join_solid = None
+                        context.current_solid = None
 
-                # Resolve join target from the bodies dict
-                body_name = getattr(op, "body_name", "")
-                join_body = getattr(op, "join_body_name", "")
+                    op.execute(context)
 
-                if getattr(op, "join", False) and join_body:
-                    context.join_solid = self._bodies.get(join_body)
-                else:
-                    context.join_solid = None
-
-                context.current_solid = self._current_solid
-                op.execute(context)
-                self._current_solid = context.current_solid
-
-                # Store the result in the bodies dict
-                if body_name and context.current_solid is not None:
-                    self._bodies[body_name] = context.current_solid
+                    if context.current_solid is not None and body_name:
+                        self._bodies[body_name] = context.current_solid
 
             # Cache this position for future scrubs
             self._save_snapshot(i)
@@ -521,7 +550,6 @@ class Timeline:
     def _save_snapshot(self, index: int):
         """Store the current state keyed by feature *index*."""
         self._snapshots[index] = {
-            "current_solid": self._current_solid,
             "sketch_face": self._current_sketch_face,
             "sketch_all_faces": list(self._current_sketch_all_faces),
             "bodies": dict(self._bodies),
@@ -530,7 +558,6 @@ class Timeline:
     def _restore_snapshot(self, index: int):
         """Restore state from a cached snapshot at *index*."""
         snap = self._snapshots[index]
-        self._current_solid = snap["current_solid"]
         self._current_sketch_face = snap["sketch_face"]
         self._current_sketch_all_faces = list(snap["sketch_all_faces"])
         self._bodies = dict(snap["bodies"])
@@ -596,7 +623,7 @@ class Timeline:
 
     def _notify_rebuild(self):
         if self.on_rebuild:
-            self.on_rebuild(self._current_solid, self._bodies)
+            self.on_rebuild(self._bodies)
 
     def _notify_changed(self):
         if self.on_feature_changed:

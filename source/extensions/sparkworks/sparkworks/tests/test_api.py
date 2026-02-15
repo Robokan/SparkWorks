@@ -133,7 +133,7 @@ class TestAPIExtrude(omni.kit.test.AsyncTestCase):
         self.assertEqual(body, "Body1")
         self.assertEqual(len(self.api.bodies), 1)
         self.assertIn("Body1", self.api.bodies)
-        self.assertIsNotNone(self.api.current_solid)
+        self.assertIsNotNone(self.api.get_body_solid("Body1"))
 
     async def test_extrude_creates_solid(self):
         """The extruded body should have a non-None solid."""
@@ -154,7 +154,7 @@ class TestAPIExtrude(omni.kit.test.AsyncTestCase):
         self.api.finish_sketch(sk)
         self.api.extrude(distance=20)
 
-        self.assertIsNotNone(self.api.current_solid)
+        self.assertIsNotNone(self.api.get_body_solid("Body1"))
 
     async def test_two_independent_bodies(self):
         """Two separate sketch+extrude pairs create two bodies."""
@@ -219,10 +219,10 @@ class TestAPIOtherOps(omni.kit.test.AsyncTestCase):
         self.api.revolve(angle=360, axis="Z")
 
         self.assertEqual(self.api.feature_count, 2)
-        self.assertIsNotNone(self.api.current_solid)
+        self.assertGreater(len(self.api.bodies), 0)
 
     async def test_fillet(self):
-        """Fillet should modify the current solid without error."""
+        """Fillet should modify the target body without error."""
         sk = self.api.create_sketch("XY")
         self.api.add_rectangle(sk, 10, 10)
         self.api.finish_sketch(sk)
@@ -230,10 +230,10 @@ class TestAPIOtherOps(omni.kit.test.AsyncTestCase):
         self.api.fillet(radius=0.5)
 
         self.assertEqual(self.api.feature_count, 3)
-        self.assertIsNotNone(self.api.current_solid)
+        self.assertIsNotNone(self.api.get_body_solid("Body1"))
 
     async def test_chamfer(self):
-        """Chamfer should modify the current solid without error."""
+        """Chamfer should modify the target body without error."""
         sk = self.api.create_sketch("XY")
         self.api.add_rectangle(sk, 10, 10)
         self.api.finish_sketch(sk)
@@ -241,7 +241,7 @@ class TestAPIOtherOps(omni.kit.test.AsyncTestCase):
         self.api.chamfer(length=0.5)
 
         self.assertEqual(self.api.feature_count, 3)
-        self.assertIsNotNone(self.api.current_solid)
+        self.assertIsNotNone(self.api.get_body_solid("Body1"))
 
 
 class TestAPITimeline(omni.kit.test.AsyncTestCase):
@@ -309,7 +309,6 @@ class TestAPITimeline(omni.kit.test.AsyncTestCase):
         self.api.clear_all()
         self.assertEqual(self.api.feature_count, 0)
         self.assertEqual(len(self.api.bodies), 0)
-        self.assertIsNone(self.api.current_solid)
 
     async def test_rebuild_all(self):
         """Rebuild all should not change the result."""
@@ -531,3 +530,107 @@ class TestAPIEdgeCases(omni.kit.test.AsyncTestCase):
         self.api.finish_sketch(sk2)
         body = self.api.extrude(distance=5)
         self.assertEqual(body, "Body1")
+
+
+class TestAPIBoolean(omni.kit.test.AsyncTestCase):
+    """Test boolean body merge operations (union, cut, intersect)."""
+
+    async def setUp(self):
+        from sparkworks.api import SparkWorksAPI
+        self.api = SparkWorksAPI(use_bridge=False)
+        # Create two separate bodies: a box and a smaller box
+        sk1 = self.api.create_sketch("XY")
+        self.api.add_rectangle(sk1, 20, 20, center=(0, 0))
+        self.api.finish_sketch(sk1)
+        self.api.extrude(distance=10)
+
+        sk2 = self.api.create_sketch("XY")
+        self.api.add_rectangle(sk2, 10, 10, center=(5, 5))
+        self.api.finish_sketch(sk2)
+        self.api.extrude(distance=15)
+
+    async def test_two_bodies_exist(self):
+        """After setup, we should have 2 bodies."""
+        self.assertEqual(len(self.api.bodies), 2)
+        self.assertIn("Body1", self.api.bodies)
+        self.assertIn("Body2", self.api.bodies)
+
+    async def test_boolean_union(self):
+        """Boolean union should fuse two bodies into one."""
+        result = self.api.boolean_union("Body1", "Body2")
+        self.assertEqual(result, "Body1")
+        # Tool body (Body2) is consumed
+        self.assertNotIn("Body2", self.api.bodies)
+        self.assertIn("Body1", self.api.bodies)
+        # The result solid should not be None
+        self.assertIsNotNone(self.api.bodies["Body1"])
+
+    async def test_boolean_cut(self):
+        """Boolean cut should subtract tool from target."""
+        result = self.api.boolean_cut("Body1", "Body2")
+        self.assertEqual(result, "Body1")
+        self.assertNotIn("Body2", self.api.bodies)
+        self.assertIn("Body1", self.api.bodies)
+        self.assertIsNotNone(self.api.bodies["Body1"])
+
+    async def test_boolean_intersect(self):
+        """Boolean intersect should keep only overlapping volume."""
+        result = self.api.boolean_intersect("Body1", "Body2")
+        self.assertEqual(result, "Body1")
+        self.assertNotIn("Body2", self.api.bodies)
+        self.assertIn("Body1", self.api.bodies)
+        self.assertIsNotNone(self.api.bodies["Body1"])
+
+    async def test_boolean_keep_tool(self):
+        """With keep_tool=True, tool body should survive."""
+        self.api.boolean_union("Body1", "Body2", keep_tool=True)
+        self.assertIn("Body1", self.api.bodies)
+        self.assertIn("Body2", self.api.bodies)
+
+    async def test_boolean_same_body_raises(self):
+        """Trying to boolean a body with itself should raise ValueError."""
+        with self.assertRaises(ValueError):
+            self.api.boolean_union("Body1", "Body1")
+
+    async def test_boolean_missing_body_raises(self):
+        """Trying to boolean with non-existent body should raise ValueError."""
+        with self.assertRaises(ValueError):
+            self.api.boolean_union("Body1", "BodyX")
+
+    async def test_boolean_timeline_feature_count(self):
+        """Boolean adds one feature to the timeline."""
+        count_before = self.api.feature_count
+        self.api.boolean_union("Body1", "Body2")
+        self.assertEqual(self.api.feature_count, count_before + 1)
+
+    async def test_boolean_serialization_roundtrip(self):
+        """Boolean operations should survive timeline scrub and rebuild."""
+        self.api.boolean_cut("Body1", "Body2")
+        solid_after_cut = self.api.bodies["Body1"]
+
+        # Scrub to start (clears everything), then back to end
+        self.api.scrub_to_start()
+        self.assertEqual(len(self.api.bodies), 0)
+
+        self.api.scrub_to_end()
+        self.assertIn("Body1", self.api.bodies)
+        self.assertNotIn("Body2", self.api.bodies)
+
+    async def test_boolean_union_then_cut(self):
+        """Chain union then cut with a third body."""
+        # Create a third body
+        sk3 = self.api.create_sketch("XY")
+        self.api.add_rectangle(sk3, 5, 5, center=(-5, -5))
+        self.api.finish_sketch(sk3)
+        self.api.extrude(distance=8)
+
+        self.assertEqual(len(self.api.bodies), 3)
+
+        # Union Body1+Body2
+        self.api.boolean_union("Body1", "Body2")
+        self.assertEqual(len(self.api.bodies), 2)  # Body1 + Body3
+
+        # Cut Body3 from Body1
+        self.api.boolean_cut("Body1", "Body3")
+        self.assertEqual(len(self.api.bodies), 1)
+        self.assertIn("Body1", self.api.bodies)

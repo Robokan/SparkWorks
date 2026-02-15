@@ -33,9 +33,9 @@ FEATURE_ICON_FILES = {
     "REVOLVE":            os.path.join(_ICONS_DIR, "toolbar_revolve.svg"),
     "FILLET":             os.path.join(_ICONS_DIR, "toolbar_fillet.svg"),
     "CHAMFER":            os.path.join(_ICONS_DIR, "toolbar_chamfer.svg"),
-    "BOOLEAN_JOIN":       os.path.join(_ICONS_DIR, "boolean_join.svg"),
-    "BOOLEAN_CUT":        os.path.join(_ICONS_DIR, "boolean_cut.svg"),
-    "BOOLEAN_INTERSECT":  os.path.join(_ICONS_DIR, "boolean_intersect.svg"),
+    "BOOLEAN_JOIN":       os.path.join(_ICONS_DIR, "toolbar_boolean_union.svg"),
+    "BOOLEAN_CUT":        os.path.join(_ICONS_DIR, "toolbar_boolean_cut.svg"),
+    "BOOLEAN_INTERSECT":  os.path.join(_ICONS_DIR, "toolbar_boolean_intersect.svg"),
 }
 
 # ── Colours ─────────────────────────────────────────────────────────────────

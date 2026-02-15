@@ -36,6 +36,7 @@ from .kernel.construction_plane import (
     get_planar_face,
 )
 from .kernel.operations import (
+    BooleanOperation,
     ExtrudeOperation,
     RevolveOperation,
     FilletOperation,
@@ -83,7 +84,7 @@ class SparkWorksAPI:
     # Internal helpers
     # =====================================================================
 
-    def _on_rebuild(self, solid, bodies=None):
+    def _on_rebuild(self, bodies=None):
         """Callback from Timeline — cache the bodies dict."""
         self._last_rebuild_bodies = dict(bodies) if bodies else {}
         # Write meshes to USD if a bridge is available
@@ -309,19 +310,122 @@ class SparkWorksAPI:
 
         return face_body
 
+    # -- Boolean body operations -----------------------------------------------
+
+    def boolean_union(
+        self,
+        target_body: str,
+        tool_body: str,
+        keep_tool: bool = False,
+    ) -> str:
+        """
+        Fuse (union) *tool_body* into *target_body*.
+
+        By default the tool body is consumed (removed from the bodies dict).
+
+        Args:
+            target_body: Name of the body that receives the result.
+            tool_body: Name of the body used as the tool.
+            keep_tool: If ``True``, keep the tool body after the operation.
+
+        Returns:
+            The *target_body* name.
+        """
+        return self._boolean("union", target_body, tool_body, keep_tool)
+
+    def boolean_cut(
+        self,
+        target_body: str,
+        tool_body: str,
+        keep_tool: bool = False,
+    ) -> str:
+        """
+        Subtract *tool_body* from *target_body*.
+
+        Args:
+            target_body: Body that receives the result (material removed).
+            tool_body: Body used as the cutting tool (consumed by default).
+            keep_tool: If ``True``, keep the tool body after the operation.
+
+        Returns:
+            The *target_body* name.
+        """
+        return self._boolean("cut", target_body, tool_body, keep_tool)
+
+    def boolean_intersect(
+        self,
+        target_body: str,
+        tool_body: str,
+        keep_tool: bool = False,
+    ) -> str:
+        """
+        Keep only the overlapping volume of *target_body* and *tool_body*.
+
+        Args:
+            target_body: Body that receives the result.
+            tool_body: Body used as the intersection tool (consumed by default).
+            keep_tool: If ``True``, keep the tool body after the operation.
+
+        Returns:
+            The *target_body* name.
+        """
+        return self._boolean("intersect", target_body, tool_body, keep_tool)
+
+    def _boolean(
+        self,
+        mode: str,
+        target_body: str,
+        tool_body: str,
+        keep_tool: bool = False,
+    ) -> str:
+        """Internal helper shared by all boolean methods."""
+        if target_body not in self._timeline.bodies:
+            raise ValueError(f"Target body '{target_body}' does not exist")
+        if tool_body not in self._timeline.bodies:
+            raise ValueError(f"Tool body '{tool_body}' does not exist")
+        if target_body == tool_body:
+            raise ValueError("Target and tool body must be different")
+
+        op = BooleanOperation(
+            mode=mode,
+            target_body=target_body,
+            tool_body=tool_body,
+            keep_tool=keep_tool,
+        )
+        op.name = self._next_feature_name(f"Boolean {mode.capitalize()}")
+
+        marker = self._effective_marker()
+        self._timeline.add_operation(op, name=op.name, insert_after=marker)
+        self._save_to_usd()
+
+        if marker is not None:
+            self._marker_position = marker + 1
+        else:
+            self._marker_position = self._timeline.feature_count - 1
+
+        return target_body
+
     def revolve(
         self,
         angle: float = 360.0,
         axis: str = "Z",
-    ) -> None:
+        body_name: Optional[str] = None,
+    ) -> str:
         """
         Revolve the current sketch profile around an axis.
 
         Args:
             angle: Revolution angle in degrees.
             axis: ``"X"``, ``"Y"``, or ``"Z"``.
+            body_name: Explicit body name.  Auto-generated if ``None``.
+
+        Returns:
+            The body name.
         """
-        op = RevolveOperation(angle=angle, axis_name=axis)
+        if body_name is None:
+            self._body_counter += 1
+            body_name = f"Body{self._body_counter}"
+        op = RevolveOperation(angle=angle, axis_name=axis, body_name=body_name)
         op.name = self._next_feature_name("Revolve")
 
         marker = self._effective_marker()
@@ -333,19 +437,28 @@ class SparkWorksAPI:
         else:
             self._marker_position = self._timeline.feature_count - 1
 
+        return body_name
+
     def fillet(
         self,
         radius: float = 1.0,
+        body_name: Optional[str] = None,
         edge_indices: Optional[List[int]] = None,
     ) -> None:
         """
-        Apply a fillet to edges of the current solid.
+        Apply a fillet to edges of a body.
 
         Args:
             radius: Fillet radius.
+            body_name: Target body.  If ``None``, uses the last body.
             edge_indices: Specific edges, or ``None`` for all.
         """
-        op = FilletOperation(radius=radius, edge_indices=edge_indices)
+        if body_name is None:
+            bodies = self._timeline.bodies
+            if not bodies:
+                return
+            body_name = list(bodies.keys())[-1]
+        op = FilletOperation(radius=radius, body_name=body_name, edge_indices=edge_indices)
         op.name = self._next_feature_name("Fillet")
 
         marker = self._effective_marker()
@@ -360,16 +473,23 @@ class SparkWorksAPI:
     def chamfer(
         self,
         length: float = 1.0,
+        body_name: Optional[str] = None,
         edge_indices: Optional[List[int]] = None,
     ) -> None:
         """
-        Apply a chamfer to edges of the current solid.
+        Apply a chamfer to edges of a body.
 
         Args:
             length: Chamfer length.
+            body_name: Target body.  If ``None``, uses the last body.
             edge_indices: Specific edges, or ``None`` for all.
         """
-        op = ChamferOperation(length=length, edge_indices=edge_indices)
+        if body_name is None:
+            bodies = self._timeline.bodies
+            if not bodies:
+                return
+            body_name = list(bodies.keys())[-1]
+        op = ChamferOperation(length=length, body_name=body_name, edge_indices=edge_indices)
         op.name = self._next_feature_name("Chamfer")
 
         marker = self._effective_marker()
@@ -396,7 +516,6 @@ class SparkWorksAPI:
         self._marker_position = index
         if index < 0:
             self._timeline._scrub_index = -1
-            self._timeline._current_solid = None
             self._timeline._bodies = {}
             self._timeline._current_sketch_face = None
             self._timeline._notify_rebuild()
@@ -477,8 +596,11 @@ class SparkWorksAPI:
 
     @property
     def current_solid(self):
-        """The last solid produced by the timeline (or ``None``)."""
-        return self._timeline.current_solid
+        """The last body solid (or ``None``).  Prefer using ``bodies`` dict directly."""
+        bodies = self._timeline.bodies
+        if bodies:
+            return list(bodies.values())[-1]
+        return None
 
     @property
     def marker_position(self) -> int:

@@ -221,9 +221,11 @@ class RevolveOperation(BaseOperation):
     Parameters:
         angle: Revolution angle in degrees (360 = full revolution)
         axis: Which axis to revolve around ("X", "Y", or "Z")
+        body_name: Name of the body this creates/updates.
     """
     angle: float = 360.0
     axis_name: str = "Z"
+    body_name: str = ""
     op_type: OperationType = field(default=OperationType.REVOLVE, init=False)
 
     @property
@@ -245,12 +247,17 @@ class RevolveOperation(BaseOperation):
             "name": self.name,
             "angle": self.angle,
             "axis": self.axis_name,
+            "body_name": self.body_name,
             "suppressed": self.suppressed,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "RevolveOperation":
-        op = cls(angle=d.get("angle", 360.0), axis_name=d.get("axis", "Z"))
+        op = cls(
+            angle=d.get("angle", 360.0),
+            axis_name=d.get("axis", "Z"),
+            body_name=d.get("body_name", ""),
+        )
         op.name = d.get("name", "Revolve")
         op.suppressed = d.get("suppressed", False)
         return op
@@ -263,13 +270,15 @@ class RevolveOperation(BaseOperation):
 @dataclass
 class FilletOperation(BaseOperation):
     """
-    Apply a fillet (rounding) to edges of the current solid.
+    Apply a fillet (rounding) to edges of a named body.
 
     Parameters:
         radius: Fillet radius
+        body_name: Target body to fillet.
         edge_indices: Which edges to fillet (None = all edges)
     """
     radius: float = 1.0
+    body_name: str = ""
     edge_indices: Optional[List[int]] = None
     op_type: OperationType = field(default=OperationType.FILLET, init=False)
 
@@ -293,6 +302,7 @@ class FilletOperation(BaseOperation):
             "type": "fillet",
             "name": self.name,
             "radius": self.radius,
+            "body_name": self.body_name,
             "edge_indices": self.edge_indices,
             "suppressed": self.suppressed,
         }
@@ -301,6 +311,7 @@ class FilletOperation(BaseOperation):
     def from_dict(cls, d: dict) -> "FilletOperation":
         op = cls(
             radius=d.get("radius", 1.0),
+            body_name=d.get("body_name", ""),
             edge_indices=d.get("edge_indices"),
         )
         op.name = d.get("name", "Fillet")
@@ -315,13 +326,15 @@ class FilletOperation(BaseOperation):
 @dataclass
 class ChamferOperation(BaseOperation):
     """
-    Apply a chamfer (bevel) to edges of the current solid.
+    Apply a chamfer (bevel) to edges of a named body.
 
     Parameters:
         length: Chamfer length
+        body_name: Target body to chamfer.
         edge_indices: Which edges to chamfer (None = all edges)
     """
     length: float = 1.0
+    body_name: str = ""
     edge_indices: Optional[List[int]] = None
     op_type: OperationType = field(default=OperationType.CHAMFER, init=False)
 
@@ -345,6 +358,7 @@ class ChamferOperation(BaseOperation):
             "type": "chamfer",
             "name": self.name,
             "length": self.length,
+            "body_name": self.body_name,
             "edge_indices": self.edge_indices,
             "suppressed": self.suppressed,
         }
@@ -353,6 +367,7 @@ class ChamferOperation(BaseOperation):
     def from_dict(cls, d: dict) -> "ChamferOperation":
         op = cls(
             length=d.get("length", 1.0),
+            body_name=d.get("body_name", ""),
             edge_indices=d.get("edge_indices"),
         )
         op.name = d.get("name", "Chamfer")
@@ -361,60 +376,91 @@ class ChamferOperation(BaseOperation):
 
 
 # ---------------------------------------------------------------------------
-# Boolean Operations
+# Boolean Operations (Union / Cut / Intersect between bodies)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class BooleanOperation(BaseOperation):
     """
-    Boolean operation between current solid and a tool solid.
+    Boolean operation between two named bodies.
 
-    The tool_solid should be set before execution (typically from another
-    feature's output stored in the timeline).
+    Combines *target_body* and *tool_body* using the chosen *mode*,
+    stores the result under *target_body*, and removes *tool_body*
+    from the bodies dict (the tool body is consumed).
 
     Parameters:
-        mode: "join", "cut", or "intersect"
+        mode: ``"union"`` (fuse), ``"cut"`` (subtract tool from target),
+              or ``"intersect"`` (keep only overlapping volume).
+              Legacy value ``"join"`` is treated as ``"union"``.
+        target_body: Name of the body that receives the result.
+        tool_body: Name of the body used as the tool (consumed).
+        keep_tool: If ``True``, the tool body is **not** removed from the
+              bodies dict after the operation.  Default ``False`` (FreeCAD
+              style — tool is consumed).
     """
-    mode: str = "join"
-    tool_feature_index: Optional[int] = None  # Index into timeline of the tool body
-    _tool_solid: Optional[Part] = field(default=None, repr=False)
+    mode: str = "union"
+    target_body: str = ""
+    tool_body: str = ""
+    keep_tool: bool = False
+    op_type: OperationType = field(default=OperationType.BOOLEAN_JOIN, init=False)
 
     def __post_init__(self):
         mode_map = {
-            "join": OperationType.BOOLEAN_JOIN,
+            "union": OperationType.BOOLEAN_JOIN,
+            "join": OperationType.BOOLEAN_JOIN,   # legacy compat
             "cut": OperationType.BOOLEAN_CUT,
             "intersect": OperationType.BOOLEAN_INTERSECT,
         }
         self.op_type = mode_map.get(self.mode, OperationType.BOOLEAN_JOIN)
 
     def execute(self, context: OperationContext):
-        if self.suppressed or context.current_solid is None or self._tool_solid is None:
+        """
+        Execute the boolean operation.
+
+        The timeline sets ``context.current_solid`` to the *target* body
+        and ``context.join_solid`` to the *tool* body before calling this.
+        """
+        if self.suppressed:
+            return
+        if context.current_solid is None or context.join_solid is None:
             return
 
-        solid = context.current_solid
-        tool = self._tool_solid
+        target = context.current_solid
+        tool = context.join_solid
+        mode = self.mode if self.mode != "join" else "union"
 
-        if self.mode == "join":
-            context.current_solid = solid.fuse(tool)
-        elif self.mode == "cut":
-            context.current_solid = solid.cut(tool)
-        elif self.mode == "intersect":
-            context.current_solid = solid.intersect(tool)
+        try:
+            if mode == "union":
+                context.current_solid = target.fuse(tool).clean()
+            elif mode == "cut":
+                context.current_solid = target.cut(tool).clean()
+            elif mode == "intersect":
+                context.current_solid = target.intersect(tool).clean()
+            else:
+                print(f"[SparkWorks] Unknown boolean mode: {mode}")
+                return
+            print(f"[SparkWorks] Boolean {mode}: {self.target_body} {mode} {self.tool_body}")
+        except Exception as e:
+            print(f"[SparkWorks] Boolean {mode} failed: {e}")
 
     def to_dict(self) -> dict:
         return {
             "type": "boolean",
             "name": self.name,
             "mode": self.mode,
-            "tool_feature_index": self.tool_feature_index,
+            "target_body": self.target_body,
+            "tool_body": self.tool_body,
+            "keep_tool": self.keep_tool,
             "suppressed": self.suppressed,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "BooleanOperation":
         op = cls(
-            mode=d.get("mode", "join"),
-            tool_feature_index=d.get("tool_feature_index"),
+            mode=d.get("mode", "union"),
+            target_body=d.get("target_body", ""),
+            tool_body=d.get("tool_body", ""),
+            keep_tool=d.get("keep_tool", False),
         )
         op.name = d.get("name", "Boolean")
         op.suppressed = d.get("suppressed", False)
