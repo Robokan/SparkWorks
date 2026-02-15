@@ -288,6 +288,20 @@ class ParametricCadExtension(omni.ext.IExt):
         for _ in range(30):
             await omni.kit.app.get_app().next_update_async()
 
+        # Initialise settings — load from stage if present, otherwise write defaults
+        try:
+            existing = self._bridge.load_settings()
+            # If Settings prim doesn't exist yet, write defaults (creates the Xform)
+            stage = omni.usd.get_context().get_stage()
+            settings_prim = stage.GetPrimAtPath(self._bridge.settings_root) if stage else None
+            if settings_prim is None or not settings_prim.IsValid():
+                self._bridge.save_settings()  # writes DEFAULT_SETTINGS and sets metersPerUnit
+            else:
+                self._bridge.apply_settings(existing)  # respect whatever is already stored
+            print(f"[{EXTENSION_NAME}] Settings: {self._bridge.load_settings()}")
+        except Exception as e:
+            print(f"[{EXTENSION_NAME}] Could not initialise settings: {e}")
+
         try:
             result = self._bridge.create_construction_planes(self._construction_planes)
             self._plane_name_map = {
@@ -332,7 +346,14 @@ class ParametricCadExtension(omni.ext.IExt):
             print(f"[{EXTENSION_NAME}] Could not subscribe to selection events: {e}")
 
     def _on_stage_event(self, event):
-        """Handle USD stage events — we only care about selection changes."""
+        """Handle USD stage events — selection changes and stage open/reload."""
+        # --- Stage opened (File > Open, or reload) ---------------------------
+        if event.type == int(omni.usd.StageEventType.OPENED):
+            print(f"[{EXTENSION_NAME}] Stage OPENED — reloading SparkWorks state")
+            asyncio.ensure_future(self._on_stage_opened())
+            return
+
+        # --- Selection changed -----------------------------------------------
         if event.type != int(omni.usd.StageEventType.SELECTION_CHANGED):
             return
 
@@ -356,6 +377,83 @@ class ParametricCadExtension(omni.ext.IExt):
             if body_name:
                 self._on_body_clicked(body_name)
                 return
+
+    async def _on_stage_opened(self):
+        """Reload all SparkWorks state after a new stage is opened."""
+        # Give the stage a few frames to settle
+        for _ in range(10):
+            await omni.kit.app.get_app().next_update_async()
+
+        # 1) Apply settings from the file (or write defaults)
+        try:
+            stage = omni.usd.get_context().get_stage()
+            settings_prim = stage.GetPrimAtPath(self._bridge.settings_root) if stage else None
+            if settings_prim and settings_prim.IsValid():
+                self._bridge.apply_settings()
+            else:
+                self._bridge.save_settings()
+        except Exception as e:
+            print(f"[{EXTENSION_NAME}] Settings reload error: {e}")
+
+        # 2) Rebuild the construction-plane map from whatever is on stage
+        self._construction_planes = create_origin_planes()
+        try:
+            stage = omni.usd.get_context().get_stage()
+            constr_prim = stage.GetPrimAtPath(self._bridge.construction_root) if stage else None
+            if constr_prim and constr_prim.IsValid():
+                # Planes already exist in the file — just rebuild the lookup map
+                self._plane_name_map = {p.name: p for p in self._construction_planes}
+            else:
+                # No planes in the file — create them
+                result = self._bridge.create_construction_planes(self._construction_planes)
+                self._plane_name_map = {p.name: p for p in self._construction_planes}
+        except Exception as e:
+            print(f"[{EXTENSION_NAME}] Plane reload error: {e}")
+
+        # 3) Reset transient state
+        self._active_sketch = None
+        self._selected_plane = None
+        self._face_planes = []
+        self._face_plane_body = None
+        self._sketch_parent_body = None
+        self._sketch_counter = 0
+        self._feature_counter = 0
+        self._body_counter = 0
+        self._current_body_name = "Body1"
+
+        # 4) Load the timeline from USD
+        self._load_timeline_from_usd()
+
+        # 5) Update body counter from what's on stage
+        try:
+            body_names = self._bridge.get_body_names()
+            if body_names:
+                # Find highest existing body number
+                max_num = 0
+                for name in body_names:
+                    try:
+                        num = int(name.replace("Body", ""))
+                        max_num = max(max_num, num)
+                    except ValueError:
+                        pass
+                self._body_counter = max_num
+                self._current_body_name = f"Body{max_num}"
+        except Exception:
+            pass
+
+        # 6) Update feature/sketch counters from timeline
+        if self._timeline and self._timeline.features:
+            self._feature_counter = len(self._timeline.features)
+            sketch_count = sum(
+                1 for f in self._timeline.features
+                if f.feature_type == FeatureType.SKETCH
+            )
+            self._sketch_counter = sketch_count
+
+        self._set_status("Stage loaded — SparkWorks state restored")
+        _notify("SparkWorks state restored from saved stage.")
+        print(f"[{EXTENSION_NAME}] Stage reload complete: "
+              f"{self._feature_counter} features, {self._body_counter} bodies")
 
     def _on_construction_plane_clicked(self, plane: ConstructionPlane):
         """Select a construction plane (does not create a sketch yet)."""
@@ -392,9 +490,9 @@ class ParametricCadExtension(omni.ext.IExt):
             _notify(f"No planar faces on '{body_name}'.", "warning")
             return
 
-        # Show face planes as semi-transparent quads in the viewport
+        # Show face planes as semi-transparent quads under the body's Construction Xform
         try:
-            result = self._bridge.create_construction_planes(face_planes)
+            result = self._bridge.create_body_face_planes(body_name, face_planes)
             for fp in face_planes:
                 self._plane_name_map[fp.name] = fp
             self._face_planes = face_planes
@@ -419,8 +517,9 @@ class ParametricCadExtension(omni.ext.IExt):
         # Remove from plane_name_map
         for fp in self._face_planes:
             self._plane_name_map.pop(fp.name, None)
-        # Remove USD prims
-        self._bridge.remove_face_planes()
+        # Remove USD prims from the body's Construction Xform
+        if self._face_plane_body:
+            self._bridge.remove_body_face_planes(self._face_plane_body)
         self._face_planes = []
         self._face_plane_body = None
 
@@ -785,11 +884,15 @@ class ParametricCadExtension(omni.ext.IExt):
     # ========================================================================
 
     def _on_timeline_rebuild(self, solid):
+        body_name = getattr(self, '_current_body_name', 'Body1')
         if solid is not None:
-            body_name = getattr(self, '_current_body_name', 'Body1')
             prim_path = self._bridge.update_body_mesh(solid, body_name=body_name)
             if prim_path:
                 print(f"[{EXTENSION_NAME}] Body '{body_name}' updated at {prim_path}")
+        else:
+            # Scrubbed to before any extrude — remove the body mesh from viewport
+            self._bridge.update_body_mesh(None, body_name=body_name)
+            print(f"[{EXTENSION_NAME}] Scrubbed before extrude — cleared '{body_name}'")
         self._timeline_panel.update_features(
             self._timeline.features,
             self._timeline.scrub_index,

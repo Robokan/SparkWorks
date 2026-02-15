@@ -32,7 +32,14 @@ DEFAULT_ROOT_PATH = "/World/SparkWorks"
 CONSTRUCTION_SCOPE = "Construction"
 TIMELINE_SCOPE = "Timeline"
 BODIES_SCOPE = "Bodies"
+SETTINGS_SCOPE = "Settings"
 DEFAULT_DISPLAY_COLOR = (0.7, 0.7, 0.8)  # Light steel blue
+
+# Default settings values
+DEFAULT_SETTINGS = {
+    "units": "mm",              # mm | cm | m | in | ft
+    "meters_per_unit": 0.001,   # corresponds to "mm"
+}
 
 # Custom attribute namespace
 NS = "sparkworks"
@@ -202,48 +209,124 @@ class UsdBridge:
         """
         Check whether a USD prim path belongs to a construction plane.
 
+        Handles both global origin planes under
+        ``/World/SparkWorks/Construction/<name>`` and per-body face planes
+        under ``/World/SparkWorks/Bodies/<body>/Construction/<face>``.
+
         Returns:
-            The plane name (e.g. "OriginXY") if *prim_path* is under
-            the Construction scope, otherwise ``None``.
+            The plane name used as the lookup key in ``_plane_name_map``:
+            - Origin planes: e.g. ``"XY"``
+            - Face planes: e.g. ``"Body1_Face0"``
+            Returns ``None`` if the path is not a construction plane.
         """
+        # 1) Global origin planes: /World/SparkWorks/Construction/<name>
         prefix = self.construction_root + "/"
         if prim_path.startswith(prefix):
-            # The plane name is the first path component after Construction/
             remainder = prim_path[len(prefix):]
             return remainder.split("/")[0]
+
+        # 2) Per-body face planes: /World/SparkWorks/Bodies/<body>/Construction/<face>
+        bodies_prefix = self.bodies_root + "/"
+        if prim_path.startswith(bodies_prefix):
+            remainder = prim_path[len(bodies_prefix):]
+            parts = remainder.split("/")
+            # Expect: ["Body1", "Construction", "Face0"]
+            if len(parts) >= 3 and parts[1] == "Construction":
+                body_name = parts[0]
+                face_label = parts[2]
+                # Reconstruct the plane name key: "Body1_Face0"
+                return f"{body_name}_{face_label}"
+
         return None
 
     def is_body_prim(self, prim_path: str) -> Optional[str]:
         """
-        Check whether a USD prim path belongs to a body mesh.
+        Check whether a USD prim path belongs to a body mesh (not a face plane).
 
         Returns:
-            The body name (e.g. "Body1") if *prim_path* is under
-            the Bodies scope, otherwise ``None``.
+            The body name (e.g. "Body1") if *prim_path* is the body mesh
+            directly under the Bodies scope, otherwise ``None``.
+            Paths under ``Bodies/<body>/Construction/`` are NOT body prims.
         """
         prefix = self.bodies_root + "/"
         if prim_path.startswith(prefix):
             remainder = prim_path[len(prefix):]
-            return remainder.split("/")[0]
+            parts = remainder.split("/")
+            # Only match the body mesh itself (e.g. "Body1"), not children
+            # like "Body1/Construction/Face0"
+            if len(parts) == 1:
+                return parts[0]
         return None
 
-    def remove_face_planes(self):
-        """Remove face-plane visualizations (planes whose name contains '_Face')."""
+    def create_body_face_planes(
+        self, body_name: str, planes: List[ConstructionPlane]
+    ) -> Dict[str, str]:
+        """
+        Create face-plane quads under a body's own Construction Xform.
+
+        Structure::
+
+            /World/SparkWorks/Bodies/<body_name>/Construction/
+                Face0   (quad mesh)
+                Face1   (quad mesh)
+
+        Returns:
+            Mapping of plane name -> prim path.
+        """
+        if not USD_AVAILABLE:
+            print("[SparkWorks] USD API not available")
+            return {}
+
+        stage = self._get_stage()
+        if stage is None:
+            return {}
+
+        body_path = f"{self.bodies_root}/{body_name}"
+        body_prim = stage.GetPrimAtPath(body_path)
+        if not body_prim.IsValid():
+            print(f"[SparkWorks] Body '{body_name}' not found, cannot create face planes")
+            return {}
+
+        constr_path = f"{body_path}/Construction"
+        constr_prim = stage.GetPrimAtPath(constr_path)
+        if not constr_prim.IsValid():
+            UsdGeom.Xform.Define(stage, constr_path)
+
+        result: Dict[str, str] = {}
+        for plane in planes:
+            # Use a short face name (e.g. "Face0") for the prim, but keep
+            # the full plane.name (e.g. "Body1_Face0") for lookup.
+            face_label = plane.name.replace(f"{body_name}_", "")
+            prim_path = f"{constr_path}/{face_label}"
+            plane.prim_path = prim_path
+            self._write_plane_mesh(stage, prim_path, plane)
+            result[plane.name] = prim_path
+            print(f"[SparkWorks] Created face plane '{plane.name}' at {prim_path}")
+
+        return result
+
+    def remove_body_face_planes(self, body_name: str):
+        """
+        Remove the Construction Xform (and all face planes) under a body.
+        """
         if not USD_AVAILABLE:
             return
         stage = self._get_stage()
         if stage is None:
             return
-        constr_prim = stage.GetPrimAtPath(self.construction_root)
-        if not constr_prim.IsValid():
-            return
-        to_remove = []
-        for child in constr_prim.GetChildren():
-            name = child.GetName()
-            if "_Face" in name:
-                to_remove.append(child.GetPath().pathString)
-        for path in to_remove:
-            stage.RemovePrim(path)
+        constr_path = f"{self.bodies_root}/{body_name}/Construction"
+        constr_prim = stage.GetPrimAtPath(constr_path)
+        if constr_prim.IsValid():
+            stage.RemovePrim(constr_path)
+            print(f"[SparkWorks] Removed face planes at {constr_path}")
+
+    def remove_face_planes(self):
+        """Deprecated — face planes now live under each body's Construction Xform.
+
+        Use ``remove_body_face_planes(body_name)`` instead.
+        Kept as a no-op for backward compatibility.
+        """
+        pass
 
     def _write_plane_mesh(
         self,
@@ -338,6 +421,12 @@ class UsdBridge:
                 stage.RemovePrim(body_path)
             return None
 
+        # Remove stale face-plane Construction child (geometry is changing)
+        stale_constr = f"{body_path}/Construction"
+        stale_prim = stage.GetPrimAtPath(stale_constr)
+        if stale_prim.IsValid():
+            stage.RemovePrim(stale_constr)
+
         # Tessellate and write
         mesh_data = self.tessellator.tessellate(solid)
         if not mesh_data.is_valid:
@@ -360,6 +449,105 @@ class UsdBridge:
         if not bodies_prim.IsValid():
             return []
         return [child.GetName() for child in bodies_prim.GetChildren()]
+
+    # -- Settings persistence -------------------------------------------------
+
+    @property
+    def settings_root(self) -> str:
+        """USD path for the Settings Xform."""
+        return f"{self.root_path}/{SETTINGS_SCOPE}"
+
+    def save_settings(self, settings: Optional[Dict] = None) -> bool:
+        """
+        Write settings to a ``/World/SparkWorks/Settings`` Xform.
+
+        Stored attributes (``sparkworks:`` namespace)::
+
+            sparkworks:units            = "mm"
+            sparkworks:metersPerUnit    = 0.001
+
+        Also calls ``UsdGeom.SetStageMetersPerUnit`` so the viewport
+        interprets geometry in the chosen unit system.
+
+        Args:
+            settings: Dict with keys like ``units``, ``meters_per_unit``.
+                      Falls back to DEFAULT_SETTINGS if *None*.
+        Returns:
+            True on success.
+        """
+        if not USD_AVAILABLE:
+            return False
+
+        stage = self._get_stage()
+        if stage is None:
+            return False
+
+        self._ensure_root_scope(stage)
+
+        cfg = {**DEFAULT_SETTINGS, **(settings or {})}
+        path = self.settings_root
+        xf = UsdGeom.Xform.Define(stage, path)
+        prim = xf.GetPrim()
+
+        prim.GetAttribute(f"{NS}:units").Set(cfg["units"]) if prim.HasAttribute(f"{NS}:units") \
+            else prim.CreateAttribute(f"{NS}:units", Sdf.ValueTypeNames.String).Set(cfg["units"])
+
+        prim.GetAttribute(f"{NS}:metersPerUnit").Set(cfg["meters_per_unit"]) if prim.HasAttribute(f"{NS}:metersPerUnit") \
+            else prim.CreateAttribute(f"{NS}:metersPerUnit", Sdf.ValueTypeNames.Double).Set(cfg["meters_per_unit"])
+
+        # Apply to stage metadata so the viewport respects it
+        UsdGeom.SetStageMetersPerUnit(stage, cfg["meters_per_unit"])
+
+        print(f"[SparkWorks] Settings saved: units={cfg['units']} metersPerUnit={cfg['meters_per_unit']}")
+        return True
+
+    def load_settings(self) -> Dict:
+        """
+        Read settings from the ``Settings`` Xform on stage.
+
+        Returns:
+            A dict with ``units`` and ``meters_per_unit`` keys.
+            Falls back to DEFAULT_SETTINGS if the prim doesn't exist.
+        """
+        result = dict(DEFAULT_SETTINGS)
+
+        if not USD_AVAILABLE:
+            return result
+
+        stage = self._get_stage()
+        if stage is None:
+            return result
+
+        prim = stage.GetPrimAtPath(self.settings_root)
+        if not prim.IsValid():
+            return result
+
+        units_attr = prim.GetAttribute(f"{NS}:units")
+        if units_attr and units_attr.HasValue():
+            result["units"] = units_attr.Get()
+
+        mpu_attr = prim.GetAttribute(f"{NS}:metersPerUnit")
+        if mpu_attr and mpu_attr.HasValue():
+            result["meters_per_unit"] = float(mpu_attr.Get())
+
+        return result
+
+    def apply_settings(self, settings: Optional[Dict] = None):
+        """
+        Apply settings to the current stage (sets ``metersPerUnit``).
+
+        If *settings* is None the values are loaded from the USD prim first.
+        """
+        if not USD_AVAILABLE:
+            return
+
+        stage = self._get_stage()
+        if stage is None:
+            return
+
+        cfg = settings if settings is not None else self.load_settings()
+        UsdGeom.SetStageMetersPerUnit(stage, cfg["meters_per_unit"])
+        print(f"[SparkWorks] Applied stage metersPerUnit={cfg['meters_per_unit']} ({cfg['units']})")
 
     # -- Timeline persistence ------------------------------------------------
 
@@ -492,6 +680,20 @@ class UsdBridge:
         self._set_attr(prim, f"{NS}:planeName", sketch.plane_name, Sdf.ValueTypeNames.String)
         self._set_attr(prim, f"{NS}:sketchName", sketch.name, Sdf.ValueTypeNames.String)
 
+        # Persist custom plane geometry (origin + normal) for face-on-body sketches
+        cp = sketch.construction_plane
+        if cp is not None:
+            plane_type = getattr(cp, "plane_type", "XY")
+            origin = getattr(cp, "origin", (0.0, 0.0, 0.0))
+            normal = getattr(cp, "normal", (0.0, 0.0, 1.0))
+            self._set_attr(prim, f"{NS}:planeType", plane_type, Sdf.ValueTypeNames.String)
+            self._set_attr(prim, f"{NS}:planeOriginX", float(origin[0]), Sdf.ValueTypeNames.Double)
+            self._set_attr(prim, f"{NS}:planeOriginY", float(origin[1]), Sdf.ValueTypeNames.Double)
+            self._set_attr(prim, f"{NS}:planeOriginZ", float(origin[2]), Sdf.ValueTypeNames.Double)
+            self._set_attr(prim, f"{NS}:planeNormalX", float(normal[0]), Sdf.ValueTypeNames.Double)
+            self._set_attr(prim, f"{NS}:planeNormalY", float(normal[1]), Sdf.ValueTypeNames.Double)
+            self._set_attr(prim, f"{NS}:planeNormalZ", float(normal[2]), Sdf.ValueTypeNames.Double)
+
         # Create Primitives Xform
         prims_path = f"{prim_path}/Primitives"
         UsdGeom.Xform.Define(stage, prims_path)
@@ -619,11 +821,34 @@ class UsdBridge:
     def _read_sketch_from_prim(self, stage, prim):
         """Read a Sketch from a feature prim's attributes and children."""
         from ..kernel.sketch import Sketch, SketchLine, SketchRect, SketchCircle, SketchArc
+        from ..kernel.construction_plane import ConstructionPlane
 
         plane_name = self._get_attr(prim, f"{NS}:planeName") or "XY"
         sketch_name = self._get_attr(prim, f"{NS}:sketchName") or self._get_attr(prim, f"{NS}:name") or "Sketch"
 
         sketch = Sketch(name=sketch_name, plane_name=plane_name)
+
+        # Restore custom plane geometry if it was saved
+        plane_type = self._get_attr(prim, f"{NS}:planeType")
+        if plane_type is not None:
+            origin = (
+                self._get_attr(prim, f"{NS}:planeOriginX") or 0.0,
+                self._get_attr(prim, f"{NS}:planeOriginY") or 0.0,
+                self._get_attr(prim, f"{NS}:planeOriginZ") or 0.0,
+            )
+            normal = (
+                self._get_attr(prim, f"{NS}:planeNormalX") or 0.0,
+                self._get_attr(prim, f"{NS}:planeNormalY") or 0.0,
+                self._get_attr(prim, f"{NS}:planeNormalZ") or 1.0,
+            )
+            sketch.construction_plane = ConstructionPlane(
+                name=plane_name,
+                plane_type=plane_type,
+                origin=origin,
+                normal=normal,
+            )
+            print(f"[SparkWorks] Restored custom plane for '{sketch_name}': "
+                  f"origin={origin} normal={normal}")
 
         # Read primitives from the Primitives/ child
         prim_path = prim.GetPath().AppendChild("Primitives")

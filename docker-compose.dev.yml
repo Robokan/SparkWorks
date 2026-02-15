@@ -37,6 +37,9 @@ services:
       # Extension source (live mount for development)
       - ./source/extensions/sparkworks:/isaac-sim/exts/sparkworks:rw
 
+      # Workspace folder for saving USD scenes / exports
+      - ~/sparkworks-projects:/workspace:rw
+
       # Isaac Sim caches (persist across runs to avoid re-warming shaders)
       - ~/docker/isaac-sim/cache/main:/isaac-sim/.cache:rw
       - ~/docker/isaac-sim/cache/computecache:/isaac-sim/.nv/ComputeCache:rw
@@ -64,6 +67,7 @@ services:
       - DISPLAY=${DISPLAY:-:0}
     volumes:
       - ./source/extensions/sparkworks:/isaac-sim/exts/sparkworks:rw
+      - ~/sparkworks-projects:/workspace:rw
       - ~/docker/isaac-sim/cache/main:/isaac-sim/.cache:rw
       - ~/docker/isaac-sim/cache/computecache:/isaac-sim/.nv/ComputeCache:rw
       - ~/docker/isaac-sim/logs:/isaac-sim/.nvidia-omniverse/logs:rw

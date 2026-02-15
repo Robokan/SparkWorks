@@ -276,14 +276,31 @@ class Sketch:
     # -- Serialization -------------------------------------------------------
 
     def to_dict(self) -> dict:
-        return {
+        d: dict = {
             "name": self.name,
             "plane": self.plane_name,
             "primitives": [p.to_dict() for p in self.primitives],
         }
+        # Persist custom plane geometry so it survives save/load
+        if self.construction_plane is not None:
+            cp = self.construction_plane
+            d["plane_type"] = getattr(cp, "plane_type", "XY")
+            d["plane_origin"] = list(getattr(cp, "origin", (0, 0, 0)))
+            d["plane_normal"] = list(getattr(cp, "normal", (0, 0, 1)))
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "Sketch":
         sketch = cls(name=d["name"], plane_name=d["plane"])
         sketch.primitives = [primitive_from_dict(p) for p in d["primitives"]]
+
+        # Reconstruct custom plane if origin/normal were saved
+        if "plane_origin" in d and "plane_normal" in d:
+            from .construction_plane import ConstructionPlane
+            sketch.construction_plane = ConstructionPlane(
+                name=d.get("plane", "Custom"),
+                plane_type=d.get("plane_type", "CUSTOM"),
+                origin=tuple(d["plane_origin"]),
+                normal=tuple(d["plane_normal"]),
+            )
         return sketch
