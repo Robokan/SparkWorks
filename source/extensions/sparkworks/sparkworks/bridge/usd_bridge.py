@@ -335,24 +335,37 @@ class UsdBridge:
         plane: ConstructionPlane,
     ):
         """
-        Write a single construction plane as a semi-transparent quad mesh.
-        """
-        verts = plane.quad_vertices()
+        Write a construction plane as a semi-transparent mesh.
 
+        If the plane carries a ``face_mesh`` (tessellated from the actual
+        B-Rep face), that exact shape is used.  Otherwise falls back to
+        a rectangular quad.
+        """
         mesh = UsdGeom.Mesh.Define(stage, prim_path)
 
-        # 4 vertices
-        points = Vt.Vec3fArray([Gf.Vec3f(*v) for v in verts])
-        mesh.GetPointsAttr().Set(points)
+        if plane.face_mesh is not None:
+            # Exact-shape overlay from tessellated face
+            pts, fvc, fvi = plane.face_mesh
+            points = Vt.Vec3fArray([Gf.Vec3f(*p) for p in pts])
+            mesh.GetPointsAttr().Set(points)
+            mesh.GetFaceVertexCountsAttr().Set(Vt.IntArray(fvc))
+            mesh.GetFaceVertexIndicesAttr().Set(Vt.IntArray(fvi))
 
-        # 1 quad face (4 vertices)
-        mesh.GetFaceVertexCountsAttr().Set(Vt.IntArray([4]))
-        mesh.GetFaceVertexIndicesAttr().Set(Vt.IntArray([0, 1, 2, 3]))
+            # Flat normal for every vertex
+            n = Gf.Vec3f(*plane.normal)
+            mesh.GetNormalsAttr().Set(Vt.Vec3fArray([n] * len(pts)))
+            mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
+        else:
+            # Fallback: rectangular quad
+            verts = plane.quad_vertices()
+            points = Vt.Vec3fArray([Gf.Vec3f(*v) for v in verts])
+            mesh.GetPointsAttr().Set(points)
+            mesh.GetFaceVertexCountsAttr().Set(Vt.IntArray([4]))
+            mesh.GetFaceVertexIndicesAttr().Set(Vt.IntArray([0, 1, 2, 3]))
 
-        # Normal (same for all vertices — flat quad)
-        n = Gf.Vec3f(*plane.normal)
-        mesh.GetNormalsAttr().Set(Vt.Vec3fArray([n, n, n, n]))
-        mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
+            n = Gf.Vec3f(*plane.normal)
+            mesh.GetNormalsAttr().Set(Vt.Vec3fArray([n, n, n, n]))
+            mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
 
         # No subdivision
         mesh.GetSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
@@ -831,15 +844,23 @@ class UsdBridge:
         # Restore custom plane geometry if it was saved
         plane_type = self._get_attr(prim, f"{NS}:planeType")
         if plane_type is not None:
+            # Use explicit None checks — 0.0 is a valid coordinate value
+            # and must NOT be replaced by a default (Python `or` treats 0.0 as falsy)
+            ox = self._get_attr(prim, f"{NS}:planeOriginX")
+            oy = self._get_attr(prim, f"{NS}:planeOriginY")
+            oz = self._get_attr(prim, f"{NS}:planeOriginZ")
             origin = (
-                self._get_attr(prim, f"{NS}:planeOriginX") or 0.0,
-                self._get_attr(prim, f"{NS}:planeOriginY") or 0.0,
-                self._get_attr(prim, f"{NS}:planeOriginZ") or 0.0,
+                ox if ox is not None else 0.0,
+                oy if oy is not None else 0.0,
+                oz if oz is not None else 0.0,
             )
+            nnx = self._get_attr(prim, f"{NS}:planeNormalX")
+            nny = self._get_attr(prim, f"{NS}:planeNormalY")
+            nnz = self._get_attr(prim, f"{NS}:planeNormalZ")
             normal = (
-                self._get_attr(prim, f"{NS}:planeNormalX") or 0.0,
-                self._get_attr(prim, f"{NS}:planeNormalY") or 0.0,
-                self._get_attr(prim, f"{NS}:planeNormalZ") or 1.0,
+                nnx if nnx is not None else 0.0,
+                nny if nny is not None else 0.0,
+                nnz if nnz is not None else 1.0,
             )
             sketch.construction_plane = ConstructionPlane(
                 name=plane_name,
@@ -917,42 +938,47 @@ class UsdBridge:
             FilletOperation, ChamferOperation, BooleanOperation,
         )
 
+        def _v(attr_name, default):
+            """Read an attribute with a proper None-check (0.0 / False are valid)."""
+            val = self._get_attr(prim, attr_name)
+            return val if val is not None else default
+
         op_type = self._get_attr(prim, f"{NS}:opType")
         if op_type is None:
             return None
 
-        name = self._get_attr(prim, f"{NS}:name") or ""
-        suppressed = self._get_attr(prim, f"{NS}:suppressed") or False
+        name = _v(f"{NS}:name", "")
+        suppressed = _v(f"{NS}:suppressed", False)
 
         if op_type == "extrude":
             op = ExtrudeOperation(
-                distance=self._get_attr(prim, f"{NS}:distance") or 10.0,
-                symmetric=self._get_attr(prim, f"{NS}:symmetric") or False,
-                both=self._get_attr(prim, f"{NS}:both") or False,
-                neg_distance=self._get_attr(prim, f"{NS}:negDistance") or 0.0,
-                join=self._get_attr(prim, f"{NS}:join") or False,
+                distance=_v(f"{NS}:distance", 10.0),
+                symmetric=_v(f"{NS}:symmetric", False),
+                both=_v(f"{NS}:both", False),
+                neg_distance=_v(f"{NS}:negDistance", 0.0),
+                join=_v(f"{NS}:join", False),
             )
         elif op_type == "revolve":
             op = RevolveOperation(
-                angle=self._get_attr(prim, f"{NS}:angle") or 360.0,
-                axis_name=self._get_attr(prim, f"{NS}:axisName") or "Z",
+                angle=_v(f"{NS}:angle", 360.0),
+                axis_name=_v(f"{NS}:axisName", "Z"),
             )
         elif op_type == "fillet":
             edge_indices = self._get_attr(prim, f"{NS}:edgeIndices")
             op = FilletOperation(
-                radius=self._get_attr(prim, f"{NS}:radius") or 1.0,
+                radius=_v(f"{NS}:radius", 1.0),
                 edge_indices=list(edge_indices) if edge_indices else None,
             )
         elif op_type == "chamfer":
             edge_indices = self._get_attr(prim, f"{NS}:edgeIndices")
             op = ChamferOperation(
-                length=self._get_attr(prim, f"{NS}:length") or 1.0,
+                length=_v(f"{NS}:length", 1.0),
                 edge_indices=list(edge_indices) if edge_indices else None,
             )
         elif op_type == "boolean":
             tool_idx = self._get_attr(prim, f"{NS}:toolFeatureIndex")
             op = BooleanOperation(
-                mode=self._get_attr(prim, f"{NS}:mode") or "join",
+                mode=_v(f"{NS}:mode", "join"),
                 tool_feature_index=tool_idx,
             )
         else:

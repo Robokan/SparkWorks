@@ -410,7 +410,7 @@ class ParametricCadExtension(omni.ext.IExt):
         except Exception as e:
             print(f"[{EXTENSION_NAME}] Plane reload error: {e}")
 
-        # 3) Reset transient state
+        # 3) Reset everything to a clean state
         self._active_sketch = None
         self._selected_plane = None
         self._face_planes = []
@@ -421,7 +421,18 @@ class ParametricCadExtension(omni.ext.IExt):
         self._body_counter = 0
         self._current_body_name = "Body1"
 
-        # 4) Load the timeline from USD
+        # Reset the timeline and reconnect callbacks
+        self._timeline = Timeline()
+        self._connect_timeline_callbacks()
+
+        # Reset the UI panels
+        self._timeline_panel.update_features([], -1)
+        self._toolbar.set_sketch_mode(False)
+        self._toolbar.set_plane_hint("Click a plane in the viewport to start a sketch")
+        self._sketch_tool.deactivate()
+        self._toolbar.set_active_tool(None)
+
+        # 4) Load the timeline from USD (populates if saved data exists)
         self._load_timeline_from_usd()
 
         # 5) Update body counter from what's on stage

@@ -46,6 +46,11 @@ class ConstructionPlane:
     color: Tuple[float, float, float] = (0.2, 0.4, 0.9)
     opacity: float = 0.15
     prim_path: str = ""
+    # Optional tessellated face mesh for exact-shape overlays.
+    # When set, the bridge renders this mesh instead of a quad.
+    # Format: (points: List[(x,y,z)], face_vertex_counts: List[int],
+    #          face_vertex_indices: List[int])
+    face_mesh: Optional[tuple] = field(default=None, repr=False)
 
     # -- Derived geometry -----------------------------------------------------
 
@@ -210,6 +215,45 @@ def _face_half_extents(face, normal: Tuple[float, float, float]) -> Tuple[float,
         return (3.0, 3.0)
 
 
+def _tessellate_face(
+    face,
+    normal: Tuple[float, float, float],
+    offset: float,
+) -> Optional[tuple]:
+    """
+    Tessellate a build123d Face into a triangle mesh, nudged along the normal.
+
+    Returns:
+        ``(points, face_vertex_counts, face_vertex_indices)`` or *None* on
+        failure.  *points* is a list of ``(x, y, z)`` tuples.
+    """
+    try:
+        tess = face.tessellate(0.001, 0.5)
+        if tess is None:
+            return None
+        raw_verts, raw_tris = tess
+        if not raw_verts or not raw_tris:
+            return None
+
+        nx, ny, nz = normal
+        # Offset each vertex slightly along the face normal
+        points = [
+            (float(v.X) + nx * offset,
+             float(v.Y) + ny * offset,
+             float(v.Z) + nz * offset)
+            for v in raw_verts
+        ]
+        face_vertex_counts = [3] * len(raw_tris)
+        face_vertex_indices = []
+        for tri in raw_tris:
+            face_vertex_indices.extend([int(tri[0]), int(tri[1]), int(tri[2])])
+
+        return (points, face_vertex_counts, face_vertex_indices)
+    except Exception as e:
+        print(f"[SparkWorks] Face tessellation failed: {e}")
+        return None
+
+
 def extract_face_planes(
     solid,
     body_name: str = "Body",
@@ -269,7 +313,10 @@ def extract_face_planes(
             )
             normal = (nx, ny, nz)
 
-            # Size the plane quad to match the actual face
+            # Tessellate the actual face to get an exact-shape overlay
+            face_mesh = _tessellate_face(face, normal, FACE_OFFSET)
+
+            # Fallback quad size (used if tessellation fails)
             half_u, half_v = _face_half_extents(face, normal)
 
             color = _FACE_COLORS[face_idx % len(_FACE_COLORS)]
@@ -283,6 +330,7 @@ def extract_face_planes(
                 size_v=half_v,
                 color=color,
                 opacity=opacity,
+                face_mesh=face_mesh,
             )
             planes.append(plane)
             face_idx += 1
