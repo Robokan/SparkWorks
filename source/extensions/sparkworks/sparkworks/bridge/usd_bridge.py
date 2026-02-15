@@ -370,6 +370,49 @@ class UsdBridge:
             stage.RemovePrim(constr_path)
             print(f"[SparkWorks] Removed face planes at {constr_path}")
 
+    def set_body_face_planes_visible(self, body_name: str, visible: bool):
+        """
+        Show or hide all face planes under a body's Construction Xform.
+        """
+        if not USD_AVAILABLE:
+            return
+        stage = self._get_stage()
+        if stage is None:
+            return
+        constr_path = f"{self.bodies_root}/{body_name}/Construction"
+        constr_prim = stage.GetPrimAtPath(constr_path)
+        if not constr_prim.IsValid():
+            return
+        imageable = UsdGeom.Imageable(constr_prim)
+        if imageable:
+            if visible:
+                imageable.MakeVisible()
+            else:
+                imageable.MakeInvisible()
+
+    def set_all_face_planes_visible(self, visible: bool):
+        """
+        Show or hide face planes for ALL bodies on the stage.
+        """
+        if not USD_AVAILABLE:
+            return
+        stage = self._get_stage()
+        if stage is None:
+            return
+        bodies_prim = stage.GetPrimAtPath(self.bodies_root)
+        if not bodies_prim.IsValid():
+            return
+        for body_prim in bodies_prim.GetChildren():
+            constr_path = f"{body_prim.GetPath()}/Construction"
+            constr_prim = stage.GetPrimAtPath(constr_path)
+            if constr_prim.IsValid():
+                imageable = UsdGeom.Imageable(constr_prim)
+                if imageable:
+                    if visible:
+                        imageable.MakeVisible()
+                    else:
+                        imageable.MakeInvisible()
+
     def remove_face_planes(self):
         """Deprecated — face planes now live under each body's Construction Xform.
 

@@ -136,7 +136,13 @@ class Timeline:
 
     @property
     def scrub_index(self) -> int:
-        """Current scrub position (0-based). -1 or None means latest."""
+        """
+        Current scrub position (0-based).
+
+        Returns:
+            -1 means "before all features" (nothing active).
+            None / not set defaults to the last feature index (latest).
+        """
         if self._scrub_index is None:
             return len(self._features) - 1
         return self._scrub_index
@@ -144,7 +150,7 @@ class Timeline:
     @scrub_index.setter
     def scrub_index(self, value: Optional[int]):
         if value is not None:
-            value = max(0, min(value, len(self._features) - 1))
+            value = max(-1, min(value, len(self._features) - 1))
         self._scrub_index = value
 
     # -- Feature management --------------------------------------------------
@@ -157,6 +163,7 @@ class Timeline:
             sketch=sketch,
         )
         self._features.append(feature)
+        self._scrub_index = None  # always show latest after adding
         self._notify_changed()
         self.rebuild_from(len(self._features) - 1)
         return feature
@@ -171,6 +178,7 @@ class Timeline:
             operation=operation,
         )
         self._features.append(feature)
+        self._scrub_index = None  # always show latest after adding
         self._notify_changed()
         self.rebuild_from(len(self._features) - 1)
         return feature
