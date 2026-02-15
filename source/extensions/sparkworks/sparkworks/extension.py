@@ -1054,11 +1054,14 @@ class ParametricCadExtension(omni.ext.IExt):
         """
         Handle the 'Create Sketch' button.
 
-        Always enters picking mode — the user must click a construction
-        plane (origin or body face) to create the sketch.  All hidden
-        body face planes are made visible so they can be selected.
+        If a construction plane is already selected, use it immediately.
+        Otherwise enter picking mode so the user can click one.
         """
-        self._selected_plane = None  # clear any stale selection
+        if self._selected_plane is not None:
+            self._action_new_sketch_on_plane(self._selected_plane)
+            return
+
+        # No plane selected — enter picking mode
         self._picking_plane = True
 
         # Unhide all body face planes and ensure they're in the lookup map
@@ -1109,9 +1112,10 @@ class ParametricCadExtension(omni.ext.IExt):
                 import traceback
                 traceback.print_exc()
         else:
-            # New sketch — add it to the timeline
+            # New sketch — insert at marker position
             try:
-                self._timeline.add_sketch(finished_sketch)
+                marker = self._timeline_panel.marker_position
+                self._timeline.add_sketch(finished_sketch, insert_after=marker)
                 self._set_status(f"'{name}' added ({count} primitives) — ready for operations")
                 _notify(f"Sketch '{name}' added with {count} primitives.")
             except Exception as e:
@@ -1204,7 +1208,8 @@ class ParametricCadExtension(omni.ext.IExt):
             self._current_body_name = f"Body{self._body_counter}"
             self._set_status(f"Extruding {dist} units...")
 
-        self._timeline.add_operation(op, name=op.name)
+        marker = self._timeline_panel.marker_position
+        self._timeline.add_operation(op, name=op.name, insert_after=marker)
 
         if is_join:
             self._set_status(
@@ -1236,7 +1241,8 @@ class ParametricCadExtension(omni.ext.IExt):
         self._feature_counter += 1
         op = RevolveOperation(angle=angle, axis_name="Z")
         op.name = f"Revolve{self._feature_counter}"
-        self._timeline.add_operation(op, name=op.name)
+        marker = self._timeline_panel.marker_position
+        self._timeline.add_operation(op, name=op.name, insert_after=marker)
         self._set_status(f"Revolve ({angle}) complete")
 
     def _action_fillet(self):
@@ -1248,7 +1254,8 @@ class ParametricCadExtension(omni.ext.IExt):
         self._feature_counter += 1
         op = FilletOperation(radius=radius)
         op.name = f"Fillet{self._feature_counter}"
-        self._timeline.add_operation(op, name=op.name)
+        marker = self._timeline_panel.marker_position
+        self._timeline.add_operation(op, name=op.name, insert_after=marker)
         self._set_status(f"Fillet (r={radius}) applied")
 
     def _action_chamfer(self):
@@ -1260,7 +1267,8 @@ class ParametricCadExtension(omni.ext.IExt):
         self._feature_counter += 1
         op = ChamferOperation(length=length)
         op.name = f"Chamfer{self._feature_counter}"
-        self._timeline.add_operation(op, name=op.name)
+        marker = self._timeline_panel.marker_position
+        self._timeline.add_operation(op, name=op.name, insert_after=marker)
         self._set_status(f"Chamfer (l={length}) applied")
 
     def _action_rebuild_all(self):
@@ -1406,21 +1414,24 @@ class ParametricCadExtension(omni.ext.IExt):
 
     def _on_timeline_rebuild(self, solid):
         body_name = getattr(self, '_current_body_name', 'Body1')
+
+        # Always clear ALL existing bodies first so stale geometry from
+        # previous extrudes doesn't linger after inserts or reorders.
+        try:
+            all_bodies = self._bridge.get_body_names()
+            for bn in all_bodies:
+                self._bridge.update_body_mesh(None, body_name=bn)
+        except Exception:
+            pass
+
         if solid is not None:
             prim_path = self._bridge.update_body_mesh(solid, body_name=body_name)
             if prim_path:
                 print(f"[{EXTENSION_NAME}] Body '{body_name}' updated at {prim_path}")
+            # Re-create hidden face planes for the updated body
+            self._create_hidden_face_planes(body_name)
         else:
-            # Scrubbed to before any extrude — clear ALL bodies
-            try:
-                all_bodies = self._bridge.get_body_names()
-                for bn in all_bodies:
-                    self._bridge.update_body_mesh(None, body_name=bn)
-                print(f"[{EXTENSION_NAME}] Scrubbed before extrude — cleared {len(all_bodies)} bodies")
-            except Exception as exc:
-                # Fallback: at least clear the current body
-                self._bridge.update_body_mesh(None, body_name=body_name)
-                print(f"[{EXTENSION_NAME}] Scrubbed before extrude — cleared '{body_name}' (fallback: {exc})")
+            print(f"[{EXTENSION_NAME}] Rebuild produced no solid — all bodies cleared")
         self._timeline_panel.update_features(
             self._timeline.features,
             marker_pos=self._timeline.scrub_index,

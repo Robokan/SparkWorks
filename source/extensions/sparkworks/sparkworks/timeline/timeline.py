@@ -155,33 +155,68 @@ class Timeline:
 
     # -- Feature management --------------------------------------------------
 
-    def add_sketch(self, sketch: Sketch, name: Optional[str] = None) -> Feature:
-        """Add a sketch feature to the timeline."""
+    def add_sketch(self, sketch: Sketch, name: Optional[str] = None,
+                   insert_after: Optional[int] = None) -> Feature:
+        """
+        Add a sketch feature to the timeline.
+
+        Args:
+            sketch: The Sketch object.
+            name: Display name override.
+            insert_after: If given, insert after this feature index
+                          (-1 = before all features).  None = append at end.
+        """
         feature = Feature(
             name=name or sketch.name,
             feature_type=FeatureType.SKETCH,
             sketch=sketch,
         )
-        self._features.append(feature)
-        self._scrub_index = None  # always show latest after adding
+        idx = self._insert_feature(feature, insert_after)
+        self._scrub_index = None
         self._notify_changed()
-        self.rebuild_from(len(self._features) - 1)
+        self.rebuild_from(idx)
         return feature
 
     def add_operation(
-        self, operation: BaseOperation, name: Optional[str] = None
+        self, operation: BaseOperation, name: Optional[str] = None,
+        insert_after: Optional[int] = None,
     ) -> Feature:
-        """Add an operation feature to the timeline."""
+        """
+        Add an operation feature to the timeline.
+
+        Args:
+            operation: The operation object.
+            name: Display name override.
+            insert_after: If given, insert after this feature index
+                          (-1 = before all features).  None = append at end.
+        """
         feature = Feature(
             name=name or operation.name or operation.op_type.name.title(),
             feature_type=FeatureType.OPERATION,
             operation=operation,
         )
-        self._features.append(feature)
-        self._scrub_index = None  # always show latest after adding
+        idx = self._insert_feature(feature, insert_after)
+        self._scrub_index = None
         self._notify_changed()
-        self.rebuild_from(len(self._features) - 1)
+        self.rebuild_from(idx)
         return feature
+
+    def _insert_feature(self, feature: Feature, insert_after: Optional[int]) -> int:
+        """
+        Insert a feature at the right position.
+
+        Returns the index where the feature was inserted.
+        """
+        if insert_after is None or insert_after >= len(self._features) - 1:
+            # Append at end
+            self._features.append(feature)
+            return len(self._features) - 1
+        else:
+            # Insert after the given index (insert_after=-1 means before all)
+            pos = insert_after + 1
+            pos = max(0, pos)
+            self._features.insert(pos, feature)
+            return pos
 
     def remove_feature(self, index: int):
         """Remove a feature and rebuild downstream."""

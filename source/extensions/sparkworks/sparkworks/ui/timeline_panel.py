@@ -7,8 +7,7 @@ line with a ball handle on top) sits between features and controls the
 scrub position.  The marker is independent of feature selection:
 
 - **Click a feature** → selects it (shows properties), does NOT move marker.
-- **Click a marker slot** → jumps the marker there (rebuilds geometry).
-- **Drag the marker ball** horizontally to scrub through the timeline.
+- **Click between features** → moves the marker there (rebuilds geometry).
 - **|< / >| buttons** → jump to beginning / end.
 - **Right-click a feature** → context menu (suppress / delete).
 """
@@ -22,17 +21,12 @@ try:
 except ImportError:
     ui = None
 
-try:
-    import omni.kit.app
-    _HAS_KIT = True
-except ImportError:
-    _HAS_KIT = False
-
 
 # ── Colours ─────────────────────────────────────────────────────────────────
 
 MARKER_COLOR = 0xFF44AAFF          # bright blue marker line + ball
-SLOT_DOT_COLOR = 0x44FFFFFF        # faint dot for idle slots
+SLOT_BG = 0xFF222222               # slot background (subtle)
+SLOT_BG_HOVER = 0xFF333333         # slot on hover
 SELECTED_BORDER = 0xFFFF8800       # orange border for selected feature
 ACTIVE_BG = 0xFF1A3355             # feature before/at the marker
 INACTIVE_BG = 0xFF2A2A2A           # feature after the marker
@@ -43,12 +37,11 @@ INACTIVE_FG = 0xFF888888
 
 # ── Dimensions ──────────────────────────────────────────────────────────────
 
-SLOT_TOTAL_W = 20        # total width of a marker slot column
-MARKER_LINE_W = 4        # width of the active marker line
-BALL_DIAM = 14           # diameter of the ball handle
+SLOT_W = 18              # width of a clickable marker slot
 FEATURE_W = 96           # width of a feature button
 FEATURE_H = 56           # height of a feature button
-ROW_H = FEATURE_H + 4   # total height of the timeline strip row
+BALL_R = 6               # radius of the marker ball
+MARKER_LINE_W = 3        # width of the marker vertical line
 
 # ── Feature icons ───────────────────────────────────────────────────────────
 
@@ -80,9 +73,7 @@ TIMELINE_STYLE = {
 
 
 class TimelinePanel:
-    """
-    Dockable timeline panel with a Fusion 360-style playback marker.
-    """
+    """Dockable timeline panel with a Fusion 360-style playback marker."""
 
     def __init__(self):
         self._window: Optional[ui.Window] = None
@@ -90,15 +81,6 @@ class TimelinePanel:
         self._marker_pos: int = -1
         self._selected_idx: int = -1
         self._ctx_menu = None
-
-        # Drag state
-        self._dragging: bool = False
-        self._scroll_frame = None
-        self._update_sub = None
-
-        # Slot layout: list of (slot_position_int, x_left, x_right)
-        # so we can map any x coordinate to the nearest slot
-        self._slot_ranges: list = []
 
         # Callbacks (set by extension)
         self.on_feature_select: Optional[Callable] = None
@@ -128,14 +110,13 @@ class TimelinePanel:
         self._window = ui.Window(
             "CAD Timeline",
             width=400,
-            height=140,
+            height=130,
             dockPreference=ui.DockPreference.LEFT_BOTTOM,
         )
         self._window.frame.set_style(TIMELINE_STYLE)
         self._build_empty()
 
     def destroy(self):
-        self._stop_drag()
         self._ctx_menu = None
         if self._window:
             self._window.destroy()
@@ -152,7 +133,6 @@ class TimelinePanel:
             marker_pos = len(features) - 1
         self._marker_pos = marker_pos
         self._selected_idx = selected_idx
-        self._slot_ranges.clear()
         with self._window.frame:
             if not features:
                 self._build_empty()
@@ -196,101 +176,88 @@ class TimelinePanel:
 
             ui.Spacer(height=4)
 
-            # Scrollable timeline strip with FIXED height
-            self._scroll_frame = ui.ScrollingFrame(
+            # Scrollable timeline strip
+            with ui.ScrollingFrame(
                 horizontal_scrollbar_policy=ui.ScrollBarPolicy.SCROLLBAR_AS_NEEDED,
                 vertical_scrollbar_policy=ui.ScrollBarPolicy.SCROLLBAR_ALWAYS_OFF,
-                height=ROW_H,
-            )
-            with self._scroll_frame:
-                with ui.HStack(spacing=0, height=ROW_H):
-                    # Build the slot layout ranges as we go
-                    x = 0.0
-
-                    # Leading slot
-                    self._slot_ranges.append((-1, x, x + SLOT_TOTAL_W))
+                height=FEATURE_H + 8,
+            ):
+                with ui.HStack(spacing=0, height=FEATURE_H + 4):
+                    # [slot -1] [feature 0] [slot 0] [feature 1] [slot 1] ...
                     self._build_slot(-1)
-                    x += SLOT_TOTAL_W
-
                     for i in range(n):
                         self._build_feature_node(i, self._features[i])
-                        x += FEATURE_W
-
-                        self._slot_ranges.append((i, x, x + SLOT_TOTAL_W))
                         self._build_slot(i)
-                        x += SLOT_TOTAL_W
-
                     ui.Spacer(width=10)
 
-    # ── Marker slot ─────────────────────────────────────────────────────────
+    # ── Marker slot (clickable gap between features) ────────────────────────
 
     def _build_slot(self, position: int):
+        """
+        A thin clickable column between features.  The active slot shows
+        a blue ball + line; inactive slots show a subtle button.
+        """
         is_active = (position == self._marker_pos)
 
-        with ui.ZStack(width=SLOT_TOTAL_W, height=ROW_H):
-            if is_active:
-                self._build_active_marker()
-            else:
-                self._build_idle_dot()
-
-            # Click catcher
-            btn = ui.Button(
-                "",
-                width=SLOT_TOTAL_W,
-                height=ROW_H,
-                clicked_fn=lambda pos=position: self._on_slot_clicked(pos),
-                style={
-                    "Button": {
-                        "background_color": 0x00000000,
-                        "border_width": 0,
-                        "padding": 0,
-                        "margin": 0,
+        if is_active:
+            # Active marker: blue ball on top, line below
+            with ui.VStack(width=SLOT_W, height=FEATURE_H + 4, spacing=0):
+                # Ball row
+                ui.Button(
+                    "●",
+                    width=SLOT_W,
+                    height=BALL_R * 2 + 4,
+                    clicked_fn=lambda pos=position: self._on_slot_clicked(pos),
+                    style={
+                        "Button": {
+                            "background_color": 0x00000000,
+                            "border_width": 0,
+                            "padding": 0,
+                            "margin": 0,
+                        },
+                        "Button.Label": {
+                            "color": MARKER_COLOR,
+                            "font_size": 16,
+                        },
                     },
-                    "Button.Label": {"color": 0x00000000},
-                },
-            )
-            # Only the active marker ball is draggable
-            if is_active:
-                btn.set_mouse_pressed_fn(
-                    lambda x, y, b, m: self._start_drag(b)
+                    tooltip="Marker position",
                 )
-
-    def _build_active_marker(self):
-        """Ball on top, vertical line below — fixed height, centred."""
-        with ui.VStack(spacing=0, height=ROW_H):
-            # Ball
-            with ui.HStack(height=BALL_DIAM + 2):
-                ui.Spacer()
-                ui.Circle(
-                    radius=BALL_DIAM / 2,
-                    style={"background_color": MARKER_COLOR},
-                )
-                ui.Spacer()
-            # Line
-            line_h = ROW_H - BALL_DIAM - 2
-            if line_h > 0:
-                with ui.HStack(height=line_h):
+                # Line below
+                with ui.HStack():
                     ui.Spacer()
                     ui.Rectangle(
                         width=MARKER_LINE_W,
-                        height=line_h,
-                        style={"background_color": MARKER_COLOR,
-                               "border_radius": 1},
+                        style={
+                            "background_color": MARKER_COLOR,
+                            "border_radius": 1,
+                        },
                     )
                     ui.Spacer()
-
-    def _build_idle_dot(self):
-        """A small faint dot vertically centred, fixed height."""
-        with ui.VStack(height=ROW_H):
-            ui.Spacer()
-            with ui.HStack(height=8):
-                ui.Spacer()
-                ui.Circle(
-                    radius=3,
-                    style={"background_color": SLOT_DOT_COLOR},
-                )
-                ui.Spacer()
-            ui.Spacer()
+        else:
+            # Inactive slot: subtle clickable button
+            ui.Button(
+                "·",
+                width=SLOT_W,
+                height=FEATURE_H + 4,
+                clicked_fn=lambda pos=position: self._on_slot_clicked(pos),
+                style={
+                    "Button": {
+                        "background_color": SLOT_BG,
+                        "border_width": 0,
+                        "border_radius": 2,
+                        "padding": 0,
+                        "margin": 1,
+                    },
+                    "Button:hovered": {
+                        "background_color": SLOT_BG_HOVER,
+                    },
+                    "Button.Label": {
+                        "color": 0xFF555555,
+                        "font_size": 14,
+                    },
+                },
+                tooltip="Click to move marker here",
+            )
 
     # ── Feature node ────────────────────────────────────────────────────────
 
@@ -333,89 +300,9 @@ class TimelinePanel:
                 self._on_feature_right_click(x, y, b, idx, sup)
         )
 
-    # ── Drag logic (app-update polling) ─────────────────────────────────────
-
-    def _start_drag(self, button):
-        """Begin dragging the marker. Uses app update loop to poll mouse."""
-        if button != 0:
-            return
-        self._dragging = True
-        if _HAS_KIT and self._update_sub is None:
-            self._update_sub = (
-                omni.kit.app.get_app()
-                .get_update_event_stream()
-                .create_subscription_to_pop(self._on_drag_update)
-            )
-
-    def _stop_drag(self):
-        self._dragging = False
-        if self._update_sub is not None:
-            self._update_sub = None  # releasing the subscription unsubscribes
-
-    def _on_drag_update(self, _event):
-        """Called every frame while dragging — poll the mouse position."""
-        if not self._dragging:
-            self._stop_drag()
-            return
-
-        # Check if left mouse button is still held
-        try:
-            import carb.input
-            input_iface = carb.input.acquire_input_interface()
-            mouse = input_iface.get_mouse()
-            if mouse is None:
-                self._stop_drag()
-                return
-            left_held = input_iface.get_mouse_button_flags(
-                mouse, carb.input.MouseInput.LEFT_BUTTON
-            )
-            if not left_held:
-                self._stop_drag()
-                return
-
-            # Get mouse x in app-window coordinates
-            mouse_pos = input_iface.get_mouse_coords_pixel(mouse)
-            mouse_x = mouse_pos[0] if mouse_pos else 0
-        except Exception:
-            self._stop_drag()
-            return
-
-        # Convert mouse_x from app-window coords to scroll-frame local coords
-        # We need the scroll frame's screen position
-        if self._scroll_frame is None:
-            self._stop_drag()
-            return
-
-        try:
-            frame_sx = self._scroll_frame.screen_position_x
-            scroll_x = self._scroll_frame.scroll_x
-            local_x = mouse_x - frame_sx + scroll_x
-        except Exception:
-            local_x = mouse_x
-
-        # Find which slot the local_x falls into
-        best_pos = self._marker_pos
-        best_dist = float("inf")
-        for pos, x_left, x_right in self._slot_ranges:
-            center = (x_left + x_right) / 2
-            d = abs(local_x - center)
-            if d < best_dist:
-                best_dist = d
-                best_pos = pos
-
-        if best_pos != self._marker_pos:
-            self._marker_pos = best_pos
-            self.update_features(
-                self._features, self._marker_pos, self._selected_idx
-            )
-            if self.on_marker_moved:
-                self.on_marker_moved(best_pos)
-
-    # ── Slot / nav interaction ──────────────────────────────────────────────
+    # ── Interaction ─────────────────────────────────────────────────────────
 
     def _on_slot_clicked(self, position: int):
-        if self._dragging:
-            return
         if position == self._marker_pos:
             return
         self._marker_pos = position
@@ -431,8 +318,6 @@ class TimelinePanel:
         end = len(self._features) - 1 if self._features else -1
         if self._marker_pos != end:
             self._on_slot_clicked(end)
-
-    # ── Feature interaction ─────────────────────────────────────────────────
 
     def _on_feature_click(self, index: int):
         self._selected_idx = index
