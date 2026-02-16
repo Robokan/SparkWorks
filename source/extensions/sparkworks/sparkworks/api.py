@@ -42,6 +42,7 @@ from .kernel.operations import (
     FilletOperation,
     ChamferOperation,
 )
+from .kernel.constraint_solver import ConstraintType
 from .timeline.timeline import Timeline, Feature, FeatureType
 from .timeline.sketch_registry import SketchRegistry
 
@@ -180,6 +181,133 @@ class SparkWorksAPI:
     ):
         """Add a three-point arc to *sketch*."""
         sketch.add_arc(start=start, mid=mid, end=end)
+
+    # -- Constraint operations on an open sketch --------------------------------
+
+    def enable_constraints(self, sketch: Sketch):
+        """
+        Enable the constraint solver on a sketch.
+
+        Must be called before adding constraints.  Can be called at any
+        time — it will register all existing primitives with the solver.
+        """
+        sketch.ensure_solver()
+
+    def add_constraint(
+        self,
+        sketch: Sketch,
+        ctype: ConstraintType,
+        entity_ids: List[int],
+        value: float = 0.0,
+        selectors: Optional[List[str]] = None,
+    ) -> int:
+        """
+        Add a geometric constraint to *sketch*.
+
+        Args:
+            sketch: The target sketch.
+            ctype: Constraint type (from ``ConstraintType`` enum).
+            entity_ids: Entity ids (obtained from ``get_entity_ids``).
+            value: Target value (distance, angle, radius, etc.).
+            selectors: Sub-element selectors (e.g. ``["start", "end"]``).
+
+        Returns:
+            Constraint id.
+        """
+        return sketch.add_constraint(ctype, entity_ids, value, selectors)
+
+    def constrain_coincident(
+        self, sketch: Sketch,
+        eid_a: int, eid_b: int,
+        sel_a: str = "", sel_b: str = "",
+    ) -> int:
+        """Add a coincident constraint between two points/sub-elements."""
+        s = sketch.ensure_solver()
+        return s.constrain_coincident(eid_a, eid_b, sel_a, sel_b)
+
+    def constrain_horizontal(self, sketch: Sketch, line_eid: int) -> int:
+        """Constrain a line to be horizontal."""
+        s = sketch.ensure_solver()
+        return s.constrain_horizontal(line_eid)
+
+    def constrain_vertical(self, sketch: Sketch, line_eid: int) -> int:
+        """Constrain a line to be vertical."""
+        s = sketch.ensure_solver()
+        return s.constrain_vertical(line_eid)
+
+    def constrain_distance(
+        self, sketch: Sketch,
+        eid_a: int, eid_b: int,
+        distance: float,
+        sel_a: str = "", sel_b: str = "",
+    ) -> int:
+        """Add a point-to-point distance constraint."""
+        s = sketch.ensure_solver()
+        return s.constrain_distance_pp(eid_a, eid_b, distance, sel_a, sel_b)
+
+    def constrain_perpendicular(self, sketch: Sketch, line_a: int, line_b: int) -> int:
+        """Constrain two lines to be perpendicular."""
+        s = sketch.ensure_solver()
+        return s.constrain_perpendicular(line_a, line_b)
+
+    def constrain_parallel(self, sketch: Sketch, line_a: int, line_b: int) -> int:
+        """Constrain two lines to be parallel."""
+        s = sketch.ensure_solver()
+        return s.constrain_parallel(line_a, line_b)
+
+    def constrain_equal_length(self, sketch: Sketch, line_a: int, line_b: int) -> int:
+        """Constrain two lines to have equal length."""
+        s = sketch.ensure_solver()
+        return s.constrain_equal_length(line_a, line_b)
+
+    def constrain_fixed(self, sketch: Sketch, eid: int, x: float, y: float) -> int:
+        """Pin a point to fixed coordinates."""
+        s = sketch.ensure_solver()
+        return s.constrain_fixed(eid, x, y)
+
+    def constrain_radius(self, sketch: Sketch, circle_eid: int, radius: float) -> int:
+        """Constrain a circle's radius."""
+        s = sketch.ensure_solver()
+        return s.constrain_radius(circle_eid, radius)
+
+    def constrain_tangent_lc(self, sketch: Sketch, line_eid: int, circle_eid: int) -> int:
+        """Constrain a line to be tangent to a circle."""
+        s = sketch.ensure_solver()
+        return s.constrain_tangent_lc(line_eid, circle_eid)
+
+    def constrain_point_on_line(self, sketch: Sketch, point_eid: int, line_eid: int) -> int:
+        """Constrain a point to lie on a line."""
+        s = sketch.ensure_solver()
+        return s.constrain_point_on_line(point_eid, line_eid)
+
+    def constrain_midpoint(self, sketch: Sketch, point_eid: int, line_eid: int) -> int:
+        """Constrain a point to be at the midpoint of a line."""
+        s = sketch.ensure_solver()
+        return s.constrain_midpoint(point_eid, line_eid)
+
+    def solve_sketch(self, sketch: Sketch) -> bool:
+        """
+        Solve all constraints on a sketch.
+
+        Returns ``True`` if all constraints are satisfied.
+        """
+        return sketch.solve_constraints()
+
+    def get_entity_ids(self, sketch: Sketch, prim_index: int) -> dict:
+        """
+        Get the solver entity ids for a primitive.
+
+        Returns a dict like ``{"line": 2, "p1": 0, "p2": 1}``.
+        """
+        return sketch.get_entity_ids_for_primitive(prim_index)
+
+    def get_sketch_dof(self, sketch: Sketch) -> int:
+        """
+        Get the approximate degrees of freedom remaining in a sketch.
+
+        Returns ``-1`` if the solver is not enabled.
+        """
+        return sketch.degrees_of_freedom
 
     def finish_sketch(self, sketch: Sketch) -> int:
         """

@@ -11,21 +11,20 @@ Coordinate handling notes
   We subtract ``widget.screen_position_x/y`` to get widget-local coords.
 * The SceneView uses ``STRETCH`` with a dynamic projection so the full
   widget maps 1-to-1 to NDC.
-* For continuous hover tracking (rubber-band preview with no button held)
-  we poll the cursor position every frame via an app-update subscription.
+* Selection is driven by the USD stage — clicking in the viewport
+  hit-tests against known primitive/point positions and sets the stage
+  selection, which then drives highlighting via ``set_selected_paths()``.
+* Rubber-band preview works during click-hold via ``set_mouse_moved_fn``.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 try:
     import omni.ui as ui
     from omni.ui import scene as sc
-    import omni.kit.app
-    import carb.input
-    import omni.appwindow
 except ImportError:
     ui = None
     sc = None
@@ -35,11 +34,19 @@ except ImportError:
 GRID_COLOR = ui.color(0.2, 0.2, 0.2) if ui else None
 AXIS_X_COLOR = ui.color(0.6, 0.15, 0.15) if ui else None
 AXIS_Y_COLOR = ui.color(0.15, 0.6, 0.15) if ui else None
-SHAPE_COLOR = ui.color(0.3, 0.6, 1.0) if ui else None
+SHAPE_COLOR = ui.color(1.0, 1.0, 1.0) if ui else None           # white lines
 SHAPE_HIGHLIGHT_COLOR = ui.color(1.0, 0.8, 0.2) if ui else None
 PREVIEW_COLOR = ui.color(1.0, 0.5, 0.2, 0.8) if ui else None
-CURSOR_COLOR = ui.color(1.0, 1.0, 1.0, 0.6) if ui else None
 POINT_COLOR = ui.color(0.3, 1.0, 0.4) if ui else None
+SELECTED_COLOR = ui.color(1.0, 1.0, 0.0, 1.0) if ui else None  # yellow for selected
+POINT_CONNECTED_COLOR = ui.color(0.1, 0.9, 0.1, 1.0) if ui else None   # green — connected
+POINT_DISCONNECTED_COLOR = ui.color(1.0, 0.2, 0.2, 1.0) if ui else None  # red — disconnected
+SNAP_HIGHLIGHT_COLOR = ui.color(0.3, 0.5, 1.0, 1.0) if ui else None     # blue — snap candidate
+CONSTRAINT_LINE_COLOR = ui.color(0.6, 0.9, 1.0, 1.0) if ui else None   # light cyan — constrained line
+CONSTRAINT_LABEL_COLOR = ui.color(1.0, 0.6, 0.2, 1.0) if ui else None  # orange — constraint label
+CONSTRAINT_ICON_COLOR = ui.color(1.0, 0.4, 0.4, 0.8) if ui else None
+COINCIDENT_COLOR = ui.color(0.9, 0.3, 0.9, 0.9) if ui else None
+SNAP_COLOR = ui.color(1.0, 0.3, 1.0, 1.0) if ui else None
 
 # Grid settings
 GRID_LINES = 20
@@ -55,7 +62,8 @@ class SketchViewport:
     Interactive 2D sketch viewport.
 
     Shows a top-down grid with sketch primitives.  Captures mouse clicks
-    and movement to support interactive drawing tools.
+    and button-held movement to support drawing tools and drag-to-move.
+    Selection is driven externally by the USD stage selection.
     """
 
     def __init__(self):
@@ -81,14 +89,32 @@ class SketchViewport:
         # Placed points (green dots)
         self._placed_points: List[Tuple[float, float]] = []
 
-        # Hover tracking subscription
-        self._update_sub = None
-        self._mouse_hovering = False
+        # Constraint data for rendering icons
+        self._constraint_data: List[dict] = []
+
+        # Selection-driven highlighting.
+        # Maps USD paths to their visual data for hit-testing and highlighting.
+        # _point_positions: maps usd_path -> (x, y) for every selectable point
+        # _prim_paths: maps prim index -> usd_path for whole primitives
+        self._point_positions: Dict[str, Tuple[float, float]] = {}
+        self._prim_paths: Dict[int, str] = {}
+        self._selected_paths: Set[str] = set()
+        self._connected_paths: Set[str] = set()  # points with coincident constraints
+        self._prim_constraint_labels: Dict[int, List[str]] = {}  # prim_idx → ["H", "∥"]
+
+        # Drag state — driven by selecting a point in the stage
+        self._drag_path: Optional[str] = None  # USD path of point being dragged
+        self._dragging: bool = False
+        self._snap_target_path: Optional[str] = None  # nearby point for snap-to-join
+        self._select_mode: bool = True  # True when no drawing tool active
 
         # Callbacks — set by the extension
         self.on_viewport_click: Optional[Callable] = None   # (world_x, world_y, button)
         self.on_viewport_move: Optional[Callable] = None     # (world_x, world_y)
         self.on_viewport_key: Optional[Callable] = None      # (key, pressed)
+        self.on_select_prim: Optional[Callable] = None       # (usd_path, add_to_selection) -> None
+        self.on_drag_point_path: Optional[Callable] = None   # (usd_path, wx, wy) -> None
+        self.on_snap_join: Optional[Callable] = None         # (drag_path, target_path) -> None
 
     @property
     def window(self):
@@ -133,12 +159,10 @@ class SketchViewport:
                 # Initial projection
                 self._apply_projection()
 
-                # Click detection — use *released* so it fires after a
-                # full press-and-release (i.e. a click, not a drag start).
+                # Click / drag / release
+                self._scene_view.set_mouse_pressed_fn(self._on_mouse_pressed)
                 self._scene_view.set_mouse_released_fn(self._on_mouse_released)
-
-                # Track enter / leave for hover polling
-                self._scene_view.set_mouse_hovered_fn(self._on_mouse_hovered)
+                self._scene_view.set_mouse_moved_fn(self._on_mouse_moved)
 
                 # Re-apply projection on resize
                 self._scene_view.set_computed_content_size_changed_fn(
@@ -149,37 +173,34 @@ class SketchViewport:
         if self._window:
             self._window.set_key_pressed_fn(self._on_key_pressed)
 
-        # Subscribe to app update for hover mouse tracking
-        self._update_sub = (
-            omni.kit.app.get_app()
-            .get_update_event_stream()
-            .create_subscription_to_pop(self._on_update, name="sparkworks_hover")
-        )
-
     def destroy(self):
-        self._update_sub = None
         if self._window:
             self._window.destroy()
             self._window = None
 
     # -- Public API -----------------------------------------------------------
 
-    def set_sketch_info(self, plane_name: str, name: str, count: int):
+    def set_sketch_info(self, plane_name: str, name: str, count: int,
+                         dof: int = -1, constraint_count: int = 0):
         self._plane_name = plane_name
         if self._info_label:
-            self._info_label.text = (
-                f"Sketch: {name}  |  Plane: {plane_name}  |  {count} primitives"
-            )
+            base = f"Sketch: {name}  |  Plane: {plane_name}  |  {count} primitives"
+            if constraint_count > 0 or dof >= 0:
+                dof_str = str(dof) if dof >= 0 else "?"
+                base += f"  |  {constraint_count} constraints  |  DOF: {dof_str}"
+            self._info_label.text = base
 
     def clear_info(self):
         if self._info_label:
             self._info_label.text = "No active sketch"
 
     def update_primitives(self, primitives: list, hidden_indices: set = None):
+        """Update the primitive list and rebuild the point/path maps."""
         if sc is None or self._scene_view is None:
             return
         self._primitives = primitives
         self._hidden_indices = hidden_indices or set()
+        self._rebuild_hit_maps()
         self._redraw()
 
     def set_preview_line(
@@ -204,6 +225,50 @@ class SketchViewport:
         self._preview_rect_c2 = corner2
         self._redraw()
 
+    def set_select_mode(self, active: bool):
+        """Enable/disable select mode (point dragging)."""
+        self._select_mode = active
+
+    def set_selected_paths(self, paths: Set[str]):
+        """
+        Set the USD paths that should be highlighted.
+
+        Called by the extension when the stage selection changes.
+        """
+        if paths != self._selected_paths:
+            self._selected_paths = set(paths)
+            self._redraw()
+
+    def set_connected_paths(self, paths: Set[str]):
+        """
+        Set point USD paths that have coincident constraints (connected).
+
+        Disconnected points are drawn red; connected ones green.
+        """
+        if paths != self._connected_paths:
+            self._connected_paths = set(paths)
+            self._redraw()
+
+    def set_prim_constraint_labels(self, labels: Dict[int, List[str]]):
+        """
+        Set per-primitive constraint labels for visual indicators.
+
+        *labels* maps primitive index → list of short labels like
+        ``["H"]``, ``["V"]``, ``["∥"]``, ``["⊥"]``, ``["="]``.
+        These are drawn as small text/icons at the midpoint of each
+        constrained line.
+        """
+        self._prim_constraint_labels = dict(labels)
+
+    def update_constraint_data(self, data: List[dict]):
+        """
+        Update the constraint visualisation data.
+
+        Each dict should have ``type`` (str), ``x`` (float), ``y`` (float).
+        """
+        self._constraint_data = list(data)
+        self._redraw()
+
     def clear_preview(self):
         self._preview_from = None
         self._preview_to = None
@@ -211,6 +276,43 @@ class SketchViewport:
         self._preview_rect_c2 = None
         self._placed_points = []
         self._redraw()
+
+    # -- Hit-map management ---------------------------------------------------
+
+    def _rebuild_hit_maps(self):
+        """
+        Rebuild the dictionaries that map USD paths to positions
+        for hit-testing and highlighting.
+        """
+        from ..kernel.sketch import SketchLine, SketchRect, SketchCircle, SketchArc
+
+        self._point_positions.clear()
+        self._prim_paths.clear()
+
+        for i, prim in enumerate(self._primitives):
+            usd_path = getattr(prim, "usd_path", None)
+            if usd_path:
+                self._prim_paths[i] = usd_path
+
+            if isinstance(prim, SketchLine):
+                sp = getattr(prim, "start_usd_path", None)
+                ep = getattr(prim, "end_usd_path", None)
+                if sp:
+                    self._point_positions[sp] = prim.start
+                if ep:
+                    self._point_positions[ep] = prim.end
+            elif isinstance(prim, SketchRect):
+                # Corner points
+                corner_paths = getattr(prim, "corner_usd_paths", None)
+                if corner_paths:
+                    corners = prim.corners
+                    for cp_path, corner_pos in zip(corner_paths, corners):
+                        if cp_path:
+                            self._point_positions[cp_path] = corner_pos
+            elif isinstance(prim, SketchCircle):
+                # Center point is the primitive path itself
+                if usd_path:
+                    self._point_positions[usd_path] = prim.center
 
     # -- Projection / aspect-ratio management --------------------------------
 
@@ -259,10 +361,9 @@ class SketchViewport:
         """
         Convert screen-absolute pixel coordinates to world coordinates.
 
-        ``set_mouse_released_fn`` and ``carb.input`` both give
-        screen-absolute coords.  We subtract the SceneView's screen
-        position to get widget-local coords, then map through the
-        orthographic projection.
+        ``set_mouse_released_fn`` gives screen-absolute coords.
+        We subtract the SceneView's screen position to get widget-local
+        coords, then map through the orthographic projection.
         """
         if self._scene_view is None:
             return (0.0, 0.0)
@@ -276,77 +377,182 @@ class SketchViewport:
         if w <= 0 or h <= 0:
             return (0.0, 0.0)
 
-        # Pixel → NDC [-1, +1]
+        # Pixel -> NDC [-1, +1]
         ndc_x = 2.0 * (local_x / w) - 1.0
         ndc_y = 1.0 - 2.0 * (local_y / h)  # Y flipped
 
-        # NDC → world
+        # NDC -> world
         world_x = ndc_x * self._proj_ex
         world_y = ndc_y * self._proj_ey
         return (world_x, world_y)
 
-    def _is_screen_over_scene(self, screen_x: float, screen_y: float) -> bool:
-        """Check if a screen-absolute position is inside the SceneView."""
-        if self._scene_view is None:
-            return False
-        lx = screen_x - self._scene_view.screen_position_x
-        ly = screen_y - self._scene_view.screen_position_y
-        w = self._scene_view.computed_width
-        h = self._scene_view.computed_height
-        return 0 <= lx <= w and 0 <= ly <= h
+    # -- Hit-testing ----------------------------------------------------------
 
-    # -- Mouse / keyboard / hover handlers ------------------------------------
+    def _hit_test(self, wx: float, wy: float) -> Optional[str]:
+        """
+        Find the nearest selectable USD path at world position (wx, wy).
+
+        Returns the USD path of the closest point/prim within hit radius,
+        or None if nothing is close.  Points are checked first (they are
+        smaller targets and more useful to select individually).
+        """
+        hit_radius = VIEW_EXTENT * 0.03
+        best_path = None
+        best_dist = float("inf")
+
+        # Check point positions first
+        for path, (px, py) in self._point_positions.items():
+            d = math.hypot(wx - px, wy - py)
+            if d < hit_radius and d < best_dist:
+                best_dist = d
+                best_path = path
+
+        # If no point hit, check line segments for proximity
+        if best_path is None:
+            from ..kernel.sketch import SketchLine
+            for i, prim in enumerate(self._primitives):
+                if i in self._hidden_indices:
+                    continue
+                usd_path = self._prim_paths.get(i)
+                if usd_path is None:
+                    continue
+                if isinstance(prim, SketchLine):
+                    d = self._point_to_segment_dist(
+                        wx, wy,
+                        prim.start[0], prim.start[1],
+                        prim.end[0], prim.end[1],
+                    )
+                    if d < hit_radius and d < best_dist:
+                        best_dist = d
+                        best_path = usd_path
+
+        return best_path
+
+    @staticmethod
+    def _point_to_segment_dist(px, py, x1, y1, x2, y2) -> float:
+        """Distance from point (px,py) to the line segment (x1,y1)-(x2,y2)."""
+        dx, dy = x2 - x1, y2 - y1
+        if dx == 0 and dy == 0:
+            return math.hypot(px - x1, py - y1)
+        t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
+        proj_x = x1 + t * dx
+        proj_y = y1 + t * dy
+        return math.hypot(px - proj_x, py - proj_y)
+
+    def _update_snap_target(self, wx: float, wy: float):
+        """
+        During a drag, find the nearest OTHER point that the dragged point
+        could snap to.  Updates ``_snap_target_path`` and redraws to show
+        visual feedback (blue highlight).
+
+        Points co-located with the drag position (i.e. connected siblings
+        that the solver moved together) are excluded so they don't mask
+        the real snap target.
+        """
+        snap_radius = VIEW_EXTENT * 0.04
+        # Threshold to detect points that are "co-moving" with the drag
+        # (already connected via solver constraints).  Must be much smaller
+        # than snap_radius so it only catches truly coincident points.
+        colocate_eps = VIEW_EXTENT * 0.003
+        best_path: Optional[str] = None
+        best_dist = float("inf")
+        for path, (px, py) in self._point_positions.items():
+            if path == self._drag_path:
+                continue  # skip the point we're dragging
+            d = math.hypot(wx - px, wy - py)
+            if d < colocate_eps:
+                continue  # skip points co-located with drag (connected siblings)
+            if d < snap_radius and d < best_dist:
+                best_dist = d
+                best_path = path
+        old = self._snap_target_path
+        self._snap_target_path = best_path
+        if old != best_path:
+            self._redraw()  # highlight change
+
+    # -- Mouse / keyboard handlers -------------------------------------------
 
     def _on_mouse_released(self, x: float, y: float, button: int, modifier: int):
-        """
-        Handle a mouse button release (= click completed).
-
-        Coordinates are screen-absolute.
-        """
+        """Handle a mouse button release (= click completed)."""
         wx, wy = self._screen_to_world(x, y)
         if self._coord_label:
             self._coord_label.text = f"  Click: ({wx:.1f}, {wy:.1f})"
+
+        # End a drag if one was active
+        if self._dragging:
+            drag_path = self._drag_path
+            snap_path = self._snap_target_path
+            self._dragging = False
+            self._drag_path = None
+            self._snap_target_path = None
+            # If released on a snap target, fire the join callback
+            if snap_path is not None and drag_path is not None and self.on_snap_join:
+                self.on_snap_join(drag_path, snap_path)
+            self._redraw()
+            return
+
+        # In select mode, try to select a prim by clicking
+        if self._select_mode and button == 0:
+            hit_path = self._hit_test(wx, wy)
+            if hit_path and self.on_select_prim:
+                # Ctrl = modifier bit 2 (value 2) in omni.ui
+                add_to_sel = bool(modifier & 2)
+                self.on_select_prim(hit_path, add_to_sel)
+                return
+
+        # Otherwise forward to the drawing tool
         if self.on_viewport_click:
             self.on_viewport_click(wx, wy, button)
 
-    def _on_mouse_hovered(self, hovered: bool):
-        """Track whether the mouse is over the SceneView."""
-        self._mouse_hovering = hovered
-
-    def _on_update(self, event):
-        """
-        Per-frame update: poll the cursor position for rubber-band preview.
-
-        This runs every frame so the rubber-band line follows the cursor
-        even when no button is held.
-        """
-        if not self._mouse_hovering:
+    def _on_mouse_pressed(self, x: float, y: float, button: int, modifier: int):
+        """Start dragging the nearest point if in Select mode."""
+        if button != 0 or not self._select_mode:
             return
-        if self.on_viewport_move is None:
+        wx, wy = self._screen_to_world(x, y)
+        hit_radius = VIEW_EXTENT * 0.03
+
+        # Check if we're near a point that can be dragged
+        best_path = None
+        best_dist = float("inf")
+        for path, (px, py) in self._point_positions.items():
+            d = math.hypot(wx - px, wy - py)
+            if d < hit_radius and d < best_dist:
+                best_dist = d
+                best_path = path
+
+        if best_path is not None:
+            self._drag_path = best_path
+            self._dragging = True
+            # Also select the point in the stage (drag = single select)
+            if self.on_select_prim:
+                self.on_select_prim(best_path, False)
+
+    def _on_mouse_moved(self, x: float, y: float, mod: int, pressed: bool):
+        """
+        Fires while a mouse button is held and the cursor moves.
+
+        Used for:
+        - Drag tracking (select mode, point dragging)
+        - Rubber-band preview during click-hold (drawing tools)
+        """
+        wx, wy = self._screen_to_world(x, y)
+
+        # Drag tracking for point prims
+        if self._dragging and self._drag_path is not None:
+            if self._coord_label:
+                self._coord_label.text = f"  Drag: ({wx:.1f}, {wy:.1f})"
+            if self.on_drag_point_path:
+                self.on_drag_point_path(self._drag_path, wx, wy)
+            # Detect snap targets (nearby points to join on release)
+            self._update_snap_target(wx, wy)
             return
 
-        try:
-            app_window = omni.appwindow.get_default_app_window()
-            iinput = carb.input.acquire_input_interface()
-            mouse = app_window.get_mouse()
-            # carb.input stores normalised mouse position in
-            # MouseInput.MOVE_X / MOVE_Y (range 0-1 of the window).
-            mx = iinput.get_mouse_value(mouse, carb.input.MouseInput.MOVE_X)
-            my = iinput.get_mouse_value(mouse, carb.input.MouseInput.MOVE_Y)
-
-            # Convert normalised window coords → screen-absolute pixels
-            win_width = app_window.get_width()
-            win_height = app_window.get_height()
-            screen_x = mx * win_width
-            screen_y = my * win_height
-
-            if self._is_screen_over_scene(screen_x, screen_y):
-                wx, wy = self._screen_to_world(screen_x, screen_y)
-                if self._coord_label:
-                    self._coord_label.text = f"  Cursor: ({wx:.1f}, {wy:.1f})"
-                self.on_viewport_move(wx, wy)
-        except Exception:
-            pass  # silently ignore if APIs aren't available
+        # Rubber-band preview: forward move to the tool manager so the
+        # preview updates while the user holds the button.
+        if self._coord_label:
+            self._coord_label.text = f"  Move: ({wx:.1f}, {wy:.1f})"
+        if self.on_viewport_move:
+            self.on_viewport_move(wx, wy)
 
     def _on_key_pressed(self, key: int, mod: int, pressed: bool):
         if self.on_viewport_key:
@@ -364,12 +570,29 @@ class SketchViewport:
             self._draw_axes()
             self._shape_transform = sc.Transform()
             with self._shape_transform:
+                from ..kernel.sketch import SketchLine
                 for i, prim in enumerate(self._primitives):
                     if i in self._hidden_indices:
                         continue
-                    is_last = (i == len(self._primitives) - 1)
-                    color = SHAPE_HIGHLIGHT_COLOR if is_last else SHAPE_COLOR
+                    # Highlight if this prim's USD path is selected
+                    prim_path = self._prim_paths.get(i)
+                    is_selected = prim_path is not None and prim_path in self._selected_paths
+                    # Constrained lines get a subtle cyan tint
+                    has_constraints = i in self._prim_constraint_labels
+                    if is_selected:
+                        color = SELECTED_COLOR
+                    elif has_constraints:
+                        color = CONSTRAINT_LINE_COLOR
+                    else:
+                        color = SHAPE_COLOR
                     self._draw_primitive(prim, color)
+
+                    # Draw constraint label at the midpoint of the line
+                    labels = self._prim_constraint_labels.get(i)
+                    if labels and isinstance(prim, SketchLine):
+                        mx = (prim.start[0] + prim.end[0]) / 2.0
+                        my = (prim.start[1] + prim.end[1]) / 2.0
+                        self._draw_constraint_label(mx, my + 2.0, labels)
 
             # Placed-point markers
             for pt in self._placed_points:
@@ -399,6 +622,26 @@ class SketchViewport:
                         color=PREVIEW_COLOR,
                         thickness=2.0,
                     )
+
+            # Point handles (from _point_positions)
+            has_snap = self._snap_target_path is not None and self._dragging
+            for path, (px, py) in self._point_positions.items():
+                is_selected = path in self._selected_paths
+                is_drag = (path == self._drag_path and self._dragging)
+                is_snap_target = (path == self._snap_target_path)
+                # Both the dragged point AND the snap target glow blue
+                is_snap = is_snap_target or (is_drag and has_snap)
+                is_connected = path in self._connected_paths
+                self._draw_point_handle(
+                    px, py,
+                    highlighted=is_selected or (is_drag and not has_snap),
+                    is_snap=is_snap,
+                    is_connected=is_connected,
+                )
+
+            # Constraint icons
+            for cdata in self._constraint_data:
+                self._draw_constraint_icon(cdata)
 
     def _draw_point_marker(self, pt: Tuple[float, float]):
         size = VIEW_EXTENT * 0.015
@@ -479,3 +722,133 @@ class SketchViewport:
             (arc.end[0], arc.end[1], 0),
             color=color, thickness=thickness,
         )
+
+    def _draw_point_handle(
+        self, x: float, y: float, highlighted: bool,
+        is_snap: bool = False, is_connected: bool = False,
+    ):
+        """Draw a small round handle at a point position.
+
+        Colors:
+        - Snap target during drag: blue, larger (candidate — not yet bound)
+        - Selected/dragging: yellow
+        - Connected (has coincident constraint): green
+        - Disconnected (free endpoint): red
+        """
+        if is_snap:
+            r = VIEW_EXTENT * 0.018
+            color = SNAP_HIGHLIGHT_COLOR
+            thickness = 4
+        elif highlighted:
+            r = VIEW_EXTENT * 0.014
+            color = SELECTED_COLOR
+            thickness = 3
+        elif is_connected:
+            r = VIEW_EXTENT * 0.012
+            color = POINT_CONNECTED_COLOR
+            thickness = 2
+        else:
+            r = VIEW_EXTENT * 0.012
+            color = POINT_DISCONNECTED_COLOR
+            thickness = 2
+        segments = 12
+        pts = []
+        for i in range(segments + 1):
+            a = 2.0 * math.pi * i / segments
+            pts.append((x + r * math.cos(a), y + r * math.sin(a), 0))
+        for i in range(segments):
+            sc.Line(pts[i], pts[i + 1], color=color, thickness=thickness)
+
+    def _draw_constraint_icon(self, cdata: dict):
+        """Draw a small icon representing a constraint near the geometry."""
+        ctype = cdata.get("type", "")
+        x = cdata.get("x", 0.0)
+        y = cdata.get("y", 0.0)
+        size = VIEW_EXTENT * 0.02
+        color = CONSTRAINT_ICON_COLOR
+
+        if ctype == "coincident":
+            color = COINCIDENT_COLOR
+            segs = 8
+            for i in range(segs):
+                a1 = 2.0 * math.pi * i / segs
+                a2 = 2.0 * math.pi * (i + 1) / segs
+                sc.Line(
+                    (x + size * 0.5 * math.cos(a1), y + size * 0.5 * math.sin(a1), 0),
+                    (x + size * 0.5 * math.cos(a2), y + size * 0.5 * math.sin(a2), 0),
+                    color=color, thickness=3,
+                )
+        elif ctype == "horizontal":
+            off = size * 0.5
+            sc.Line((x - off, y, 0), (x + off, y, 0), color=color, thickness=2)
+        elif ctype == "vertical":
+            off = size * 0.5
+            sc.Line((x, y - off, 0), (x, y + off, 0), color=color, thickness=2)
+        elif ctype == "perpendicular":
+            off = size * 0.4
+            sc.Line((x, y, 0), (x + off, y, 0), color=color, thickness=2)
+            sc.Line((x, y, 0), (x, y + off, 0), color=color, thickness=2)
+            sc.Line((x + off, y, 0), (x + off, y + off * 0.3, 0), color=color, thickness=1)
+        elif ctype == "parallel":
+            off = size * 0.3
+            sc.Line((x - off, y - off, 0), (x + off, y + off, 0), color=color, thickness=2)
+            sc.Line((x - off + off * 0.3, y - off, 0), (x + off + off * 0.3, y + off, 0), color=color, thickness=2)
+        elif ctype == "equal":
+            off = size * 0.3
+            sc.Line((x - off, y + off * 0.3, 0), (x + off, y + off * 0.3, 0), color=color, thickness=2)
+            sc.Line((x - off, y - off * 0.3, 0), (x + off, y - off * 0.3, 0), color=color, thickness=2)
+        elif ctype == "distance":
+            sc.Line((x - size, y, 0), (x + size, y, 0), color=color, thickness=2)
+            sc.Line((x - size, y, 0), (x - size + size * 0.3, y + size * 0.2, 0), color=color, thickness=1)
+            sc.Line((x - size, y, 0), (x - size + size * 0.3, y - size * 0.2, 0), color=color, thickness=1)
+            sc.Line((x + size, y, 0), (x + size - size * 0.3, y + size * 0.2, 0), color=color, thickness=1)
+            sc.Line((x + size, y, 0), (x + size - size * 0.3, y - size * 0.2, 0), color=color, thickness=1)
+        elif ctype == "fixed":
+            off = size * 0.4
+            sc.Line((x - off, y - off, 0), (x + off, y - off, 0), color=color, thickness=2)
+            for dx in [-off, 0, off]:
+                sc.Line((x + dx, y - off, 0), (x + dx - off * 0.3, y - off * 1.5, 0), color=color, thickness=1)
+
+    def _draw_constraint_label(self, x: float, y: float, labels: List[str]):
+        """
+        Draw compact constraint symbols at position (x, y).
+
+        Each label is a short string like "H", "V", "∥", "⊥", "=", "d".
+        Drawn as small iconic markers so they're visible without text rendering.
+        """
+        color = CONSTRAINT_LABEL_COLOR
+        s = VIEW_EXTENT * 0.015  # symbol half-size
+        gap = VIEW_EXTENT * 0.035  # gap between symbols
+        # Centre the row of symbols
+        total_w = len(labels) * gap
+        start_x = x - total_w / 2.0 + gap / 2.0
+
+        for j, label in enumerate(labels):
+            cx = start_x + j * gap
+            cy = y
+            if label == "H":
+                # Horizontal: small "H" shape
+                sc.Line((cx - s, cy, 0), (cx + s, cy, 0), color=color, thickness=2)
+                sc.Line((cx - s, cy - s, 0), (cx - s, cy + s, 0), color=color, thickness=1)
+                sc.Line((cx + s, cy - s, 0), (cx + s, cy + s, 0), color=color, thickness=1)
+            elif label == "V":
+                # Vertical: small "V" shape
+                sc.Line((cx - s, cy + s, 0), (cx, cy - s, 0), color=color, thickness=2)
+                sc.Line((cx + s, cy + s, 0), (cx, cy - s, 0), color=color, thickness=2)
+            elif label == "∥":
+                # Parallel: two parallel slashes
+                sc.Line((cx - s * 0.5, cy - s, 0), (cx - s * 0.5, cy + s, 0), color=color, thickness=2)
+                sc.Line((cx + s * 0.5, cy - s, 0), (cx + s * 0.5, cy + s, 0), color=color, thickness=2)
+            elif label == "⊥":
+                # Perpendicular: small right-angle
+                sc.Line((cx - s, cy - s, 0), (cx - s, cy + s, 0), color=color, thickness=2)
+                sc.Line((cx - s, cy - s, 0), (cx + s, cy - s, 0), color=color, thickness=2)
+            elif label == "=":
+                # Equal: two horizontal bars
+                sc.Line((cx - s, cy + s * 0.4, 0), (cx + s, cy + s * 0.4, 0), color=color, thickness=2)
+                sc.Line((cx - s, cy - s * 0.4, 0), (cx + s, cy - s * 0.4, 0), color=color, thickness=2)
+            elif label == "d":
+                # Distance: small arrow
+                sc.Line((cx - s, cy, 0), (cx + s, cy, 0), color=color, thickness=2)
+                sc.Line((cx + s, cy, 0), (cx + s * 0.4, cy + s * 0.5, 0), color=color, thickness=1)
+                sc.Line((cx + s, cy, 0), (cx + s * 0.4, cy - s * 0.5, 0), color=color, thickness=1)

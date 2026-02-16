@@ -14,7 +14,7 @@ Groups (left to right, separated by small spacers):
 from __future__ import annotations
 
 import os
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional, Set
 
 try:
     import omni.ui as ui
@@ -34,9 +34,17 @@ _ICONS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "icons")
 ICON = {
     "create_sketch":      os.path.join(_ICONS_DIR, "toolbar_create_sketch.svg"),
     "finish_sketch":      os.path.join(_ICONS_DIR, "toolbar_finish_sketch.svg"),
+    "select":             os.path.join(_ICONS_DIR, "toolbar_select.svg"),
     "line":               os.path.join(_ICONS_DIR, "toolbar_line.svg"),
     "rectangle":          os.path.join(_ICONS_DIR, "toolbar_rectangle.svg"),
     "circle":             os.path.join(_ICONS_DIR, "toolbar_circle.svg"),
+    "coincident":         os.path.join(_ICONS_DIR, "toolbar_coincident.svg"),
+    "horizontal":         os.path.join(_ICONS_DIR, "toolbar_horizontal.svg"),
+    "vertical":           os.path.join(_ICONS_DIR, "toolbar_vertical.svg"),
+    "distance":           os.path.join(_ICONS_DIR, "toolbar_distance.svg"),
+    "perpendicular":      os.path.join(_ICONS_DIR, "toolbar_perpendicular.svg"),
+    "parallel":           os.path.join(_ICONS_DIR, "toolbar_parallel.svg"),
+    "equal":              os.path.join(_ICONS_DIR, "toolbar_equal.svg"),
     "extrude":            os.path.join(_ICONS_DIR, "toolbar_extrude.svg"),
     "revolve":            os.path.join(_ICONS_DIR, "toolbar_revolve.svg"),
     "fillet":             os.path.join(_ICONS_DIR, "toolbar_fillet.svg"),
@@ -61,18 +69,22 @@ class SparkWorksToolbarGroup(WidgetGroup):
         # State
         self._sketch_mode = False
         self._active_tool_name: Optional[str] = None
+        self._updating_programmatically = False  # guard against re-entrancy
 
         # Widget references (set in create())
         self._btn_sketch: Optional[ui.ToolButton] = None
+        self._btn_select: Optional[ui.ToolButton] = None
         self._btn_line: Optional[ui.ToolButton] = None
         self._btn_rect: Optional[ui.ToolButton] = None
         self._btn_circle: Optional[ui.ToolButton] = None
         self._subs: list = []
 
         # Visibility groups (populated in create(), hidden by default)
-        self._sketch_tools: list = []   # [gap1, line, rect, circle]
-        self._op_tools: list = []       # [gap2, extrude, revolve, fillet, chamfer]
-        self._bool_tools: list = []     # [gap3, union, cut, intersect]
+        self._draw_tools: list = []        # [gap1, select, line, rect, circle]
+        self._constraint_gap: Optional[ui.Spacer] = None
+        self._constraint_buttons: Dict[str, ui.ToolButton] = {}  # name → button
+        self._op_tools: list = []          # [gap2, extrude, revolve, fillet, chamfer]
+        self._bool_tools: list = []        # [gap3, union, cut, intersect]
 
     # -- WidgetGroup interface ------------------------------------------------
 
@@ -86,8 +98,16 @@ class SparkWorksToolbarGroup(WidgetGroup):
         style["Button.Image::sw_sketch:checked"] = {
             "image_url": ICON["finish_sketch"],
         }
+        # Select tool
+        style["Button.Image::sw_select"] = {"image_url": ICON["select"]}
+        style["Button.Image::sw_select:checked"] = {"image_url": ICON["select"]}
         # Drawing tools
         for name in ("line", "rectangle", "circle"):
+            style[f"Button.Image::sw_{name}"] = {"image_url": ICON[name]}
+            style[f"Button.Image::sw_{name}:checked"] = {"image_url": ICON[name]}
+        # Constraint tools
+        for name in ("coincident", "horizontal", "vertical", "distance",
+                      "perpendicular", "parallel", "equal"):
             style[f"Button.Image::sw_{name}"] = {"image_url": ICON[name]}
             style[f"Button.Image::sw_{name}:checked"] = {"image_url": ICON[name]}
         # 3D operations (non-toggle, so same icon for both states)
@@ -122,10 +142,22 @@ class SparkWorksToolbarGroup(WidgetGroup):
         self._btn_sketch = btn
         widgets["sw_sketch"] = btn
 
-        # ── Small gap (sketch tools group) ──
+        # ── Small gap (draw tools group) ──
         gap1 = ui.Spacer(width=6)
         widgets["sw_gap1"] = gap1
-        self._sketch_tools = [gap1]
+        self._draw_tools = [gap1]
+
+        # ── Select (pointer) tool ──
+        btn_sel = ui.ToolButton(
+            name="sw_select", width=sz, height=sz, tooltip="Select / Drag"
+        )
+        sub = btn_sel.model.subscribe_value_changed_fn(
+            lambda m: self._on_tool_clicked("select", m)
+        )
+        self._subs.append(sub)
+        self._btn_select = btn_sel
+        widgets["sw_select"] = btn_sel
+        self._draw_tools.append(btn_sel)
 
         # ── Drawing tools ──
         for name, tooltip, attr in [
@@ -140,7 +172,31 @@ class SparkWorksToolbarGroup(WidgetGroup):
             self._subs.append(sub)
             setattr(self, attr, b)
             widgets[f"sw_{name}"] = b
-            self._sketch_tools.append(b)
+            self._draw_tools.append(b)
+
+        # ── Small gap (constraint tools group) ──
+        gap_c = ui.Spacer(width=4)
+        widgets["sw_gap_c"] = gap_c
+        self._constraint_gap = gap_c
+
+        # ── Constraint tools (fire-and-forget, individually controllable) ──
+        self._constraint_buttons = {}
+        for name, tooltip in [
+            ("coincident",    "Coincident"),
+            ("horizontal",    "Horizontal"),
+            ("vertical",      "Vertical"),
+            ("distance",      "Distance"),
+            ("perpendicular", "Perpendicular"),
+            ("parallel",      "Parallel"),
+            ("equal",         "Equal"),
+        ]:
+            b = ui.ToolButton(name=f"sw_{name}", width=sz, height=sz, tooltip=tooltip)
+            sub = b.model.subscribe_value_changed_fn(
+                lambda m, n=name: self._on_constraint_clicked(n, m)
+            )
+            self._subs.append(sub)
+            widgets[f"sw_{name}"] = b
+            self._constraint_buttons[name] = b
 
         # ── Small gap (operation tools group) ──
         gap2 = ui.Spacer(width=6)
@@ -181,31 +237,74 @@ class SparkWorksToolbarGroup(WidgetGroup):
             widgets[f"sw_{name}"] = b
             self._bool_tools.append(b)
 
-        # Start with all groups hidden — only "Create Sketch" is visible
-        self.set_sketch_tools_visible(False)
-        self.set_op_tools_visible(False)
-        self.set_bool_tools_visible(False)
+        # Apply current state.  If create() is called again by the toolbar
+        # framework (e.g. on viewport resize), this restores the correct
+        # visibility rather than resetting everything to hidden.
+        if self._sketch_mode:
+            self.set_draw_tools_visible(True)
+            self.set_constraint_tools_visible(False)
+            self.set_op_tools_visible(False)
+            self.set_bool_tools_visible(False)
+        else:
+            self.set_draw_tools_visible(False)
+            self.set_constraint_tools_visible(False)
+            self.set_op_tools_visible(False)
+            self.set_bool_tools_visible(False)
 
         return widgets
 
     def clean(self):
         self._subs.clear()
         self._btn_sketch = None
+        self._btn_select = None
         self._btn_line = None
         self._btn_rect = None
         self._btn_circle = None
-        self._sketch_tools.clear()
+        self._draw_tools.clear()
+        self._constraint_buttons.clear()
+        self._constraint_gap = None
         self._op_tools.clear()
         self._bool_tools.clear()
         super().clean()
 
     # -- Visibility control ---------------------------------------------------
 
-    def set_sketch_tools_visible(self, visible: bool):
-        """Show or hide the drawing-tool buttons (Line, Rectangle, Circle)."""
-        for w in self._sketch_tools:
+    def set_draw_tools_visible(self, visible: bool):
+        """Show or hide the drawing-tool buttons (Select, Line, Rectangle, Circle)."""
+        for w in self._draw_tools:
             if w is not None:
                 w.visible = visible
+
+    def set_constraint_tools_visible(self, visible: bool):
+        """Show or hide ALL constraint buttons (and the gap before them)."""
+        if self._constraint_gap is not None:
+            self._constraint_gap.visible = visible
+        for b in self._constraint_buttons.values():
+            if b is not None:
+                b.visible = visible
+
+    def set_applicable_constraints(self, names: Set[str]):
+        """
+        Show only the constraint buttons whose names are in *names*.
+
+        Pass an empty set to hide all constraint buttons.
+        Any button whose name is NOT in the set is hidden.
+        The gap spacer is hidden when no constraints are applicable.
+        """
+        any_visible = False
+        for name, btn in self._constraint_buttons.items():
+            show = name in names
+            btn.visible = show
+            if show:
+                any_visible = True
+        if self._constraint_gap is not None:
+            self._constraint_gap.visible = any_visible
+
+    # Kept for backward compatibility
+    def set_sketch_tools_visible(self, visible: bool):
+        """Show or hide ALL sketch-related buttons (draw + constraints)."""
+        self.set_draw_tools_visible(visible)
+        self.set_constraint_tools_visible(visible)
 
     def set_op_tools_visible(self, visible: bool):
         """Show or hide the 3D operation buttons (Extrude, Revolve, etc.)."""
@@ -223,6 +322,8 @@ class SparkWorksToolbarGroup(WidgetGroup):
 
     def _on_sketch_clicked(self, model):
         """Toggle between create and finish sketch."""
+        if self._updating_programmatically:
+            return  # ignore programmatic set_value calls
         checked = model.get_value_as_bool()
         o = self._owner
         if checked:
@@ -233,10 +334,13 @@ class SparkWorksToolbarGroup(WidgetGroup):
                 o.on_finish_sketch()
 
     def _on_tool_clicked(self, name: str, model):
-        """Toggle drawing tool.  Un-check others."""
+        """Toggle drawing / select tool.  Un-check others."""
+        if self._updating_programmatically:
+            return
         checked = model.get_value_as_bool()
         o = self._owner
         cb_map = {
+            "select":    o.on_tool_select,
             "line":      o.on_tool_line,
             "rectangle": o.on_tool_rectangle,
             "circle":    o.on_tool_circle,
@@ -244,6 +348,7 @@ class SparkWorksToolbarGroup(WidgetGroup):
         if checked:
             # Uncheck sibling tools
             for tool_name, btn in [
+                ("select", self._btn_select),
                 ("line", self._btn_line),
                 ("rectangle", self._btn_rect),
                 ("circle", self._btn_circle),
@@ -269,6 +374,15 @@ class SparkWorksToolbarGroup(WidgetGroup):
             if cb:
                 cb()
 
+    def _on_constraint_clicked(self, name: str, model):
+        """Fire-and-forget constraint button.  Un-check immediately."""
+        if model.get_value_as_bool():
+            model.set_value(False)
+            o = self._owner
+            cb = getattr(o, f"on_constraint_{name}", None)
+            if cb:
+                cb()
+
     def _on_bool_clicked(self, name: str, model):
         """Fire-and-forget boolean button.  Un-check immediately."""
         if model.get_value_as_bool():
@@ -287,26 +401,41 @@ class SparkWorksToolbarGroup(WidgetGroup):
 
     def set_sketch_mode(self, active: bool):
         self._sketch_mode = active
-        if self._btn_sketch is not None:
-            self._btn_sketch.model.set_value(active)
-            self._btn_sketch.tooltip = (
-                "Finish Sketch" if active else "Create Sketch"
-            )
-        # Show drawing tools in sketch mode, hide operations + booleans
-        self.set_sketch_tools_visible(active)
+        self._updating_programmatically = True
+        try:
+            if self._btn_sketch is not None:
+                self._btn_sketch.model.set_value(active)
+                self._btn_sketch.tooltip = (
+                    "Finish Sketch" if active else "Create Sketch"
+                )
+        finally:
+            self._updating_programmatically = False
+        # Show drawing tools in sketch mode, hide operations + booleans.
+        # Constraint buttons start hidden; the extension shows applicable
+        # ones based on what the user selects inside the sketch.
+        self.set_draw_tools_visible(active)
+        if not active:
+            self.set_constraint_tools_visible(False)
         if active:
             self.set_op_tools_visible(False)
             self.set_bool_tools_visible(False)
 
     def set_active_tool(self, tool_name: Optional[str]):
         self._active_tool_name = tool_name
-        for name, btn in [
-            ("line", self._btn_line),
-            ("rectangle", self._btn_rect),
-            ("circle", self._btn_circle),
-        ]:
-            if btn is not None:
-                btn.model.set_value(name == tool_name)
+        self._updating_programmatically = True
+        try:
+            # When tool_name is None, highlight "select" as the default
+            effective = tool_name if tool_name else "select"
+            for name, btn in [
+                ("select", self._btn_select),
+                ("line", self._btn_line),
+                ("rectangle", self._btn_rect),
+                ("circle", self._btn_circle),
+            ]:
+                if btn is not None:
+                    btn.model.set_value(name == effective)
+        finally:
+            self._updating_programmatically = False
 
 
 # ── Facade class (preserves extension.py API) ──────────────────────────────
@@ -326,6 +455,7 @@ class CadToolbar:
         self.on_create_sketch: Optional[Callable] = None
         self.on_finish_sketch: Optional[Callable] = None
         self.on_add_plane: Optional[Callable] = None
+        self.on_tool_select: Optional[Callable] = None
         self.on_tool_line: Optional[Callable] = None
         self.on_tool_rectangle: Optional[Callable] = None
         self.on_tool_circle: Optional[Callable] = None
@@ -338,6 +468,15 @@ class CadToolbar:
         self.on_boolean_intersect: Optional[Callable] = None
         self.on_rebuild_all: Optional[Callable] = None
         self.on_clear_all: Optional[Callable] = None
+
+        # Constraint tool callbacks
+        self.on_constraint_coincident: Optional[Callable] = None
+        self.on_constraint_horizontal: Optional[Callable] = None
+        self.on_constraint_vertical: Optional[Callable] = None
+        self.on_constraint_distance: Optional[Callable] = None
+        self.on_constraint_perpendicular: Optional[Callable] = None
+        self.on_constraint_parallel: Optional[Callable] = None
+        self.on_constraint_equal: Optional[Callable] = None
 
         # Status text (no-op placeholder; the native toolbar doesn't show a
         # status line — we log to the console and/or notification area instead)
@@ -384,8 +523,20 @@ class CadToolbar:
     def set_active_tool(self, tool_name: Optional[str]):
         self._group.set_active_tool(tool_name)
 
+    def set_draw_tools_visible(self, visible: bool):
+        """Show or hide the drawing-tool buttons (Select, Line, Rect, Circle)."""
+        self._group.set_draw_tools_visible(visible)
+
+    def set_constraint_tools_visible(self, visible: bool):
+        """Show or hide ALL constraint buttons."""
+        self._group.set_constraint_tools_visible(visible)
+
+    def set_applicable_constraints(self, names: Set[str]):
+        """Show only constraint buttons whose names are in *names*."""
+        self._group.set_applicable_constraints(names)
+
     def set_sketch_tools_visible(self, visible: bool):
-        """Show or hide the drawing-tool buttons (Line, Rectangle, Circle)."""
+        """Show or hide ALL sketch-related buttons (draw + constraints)."""
         self._group.set_sketch_tools_visible(visible)
 
     def set_op_tools_visible(self, visible: bool):

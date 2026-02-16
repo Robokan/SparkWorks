@@ -23,13 +23,15 @@ RUN apt-get update \
     && apt-get clean autoclean \
     && rm -rf /var/lib/apt/lists/*
 
-# Install build123d + numpy into the Kit Python environment
+# Install build123d + numpy + scipy into the Kit Python environment
 # cadquery-ocp 7.9.3 is the only version available on aarch64.
 # build123d 0.8 + OCP 7.9 have a HashCode incompatibility which we
 # monkey-patch at extension startup (see kernel/_ocp_compat.py).
+# scipy is used by the 2D geometric constraint solver (PlaneGCS-inspired).
 RUN /isaac-sim/python.sh -m pip install --no-cache-dir \
         build123d \
-        numpy
+        numpy \
+        scipy
 
 # Create directory for the extension to be mounted into
 RUN mkdir -p /isaac-sim/exts/sparkworks \

@@ -17,7 +17,8 @@ from ..kernel.sketch import SketchLine, SketchRect, SketchCircle
 
 class SketchToolMode(Enum):
     """Which drawing tool is active."""
-    NONE = auto()
+    NONE = auto()       # No tool — Select mode (drag points, click to select)
+    SELECT = auto()     # Explicit select mode (same as NONE but clearer intent)
     LINE = auto()
     RECTANGLE = auto()
     CIRCLE = auto()
@@ -89,8 +90,11 @@ class SketchToolManager:
 
     @property
     def is_drawing(self) -> bool:
-        """True when a tool is active and at least one point has been placed."""
-        return self._active_tool != SketchToolMode.NONE and len(self._points) > 0
+        """True when a drawing tool is active and at least one point has been placed."""
+        return (
+            self._active_tool not in (SketchToolMode.NONE, SketchToolMode.SELECT)
+            and len(self._points) > 0
+        )
 
     # -- Public API -----------------------------------------------------------
 
@@ -101,19 +105,28 @@ class SketchToolManager:
         self._cursor_pos = None
         self._chain_prim_count = 0
         if mode == SketchToolMode.LINE:
-            self._emit_status("Line tool — click to place first point")
+            self._emit_status("Line — click to place points, Enter to finish")
         elif mode == SketchToolMode.RECTANGLE:
-            self._emit_status("Rectangle tool — click first corner")
+            self._emit_status("Rectangle — click first corner")
         elif mode == SketchToolMode.CIRCLE:
-            self._emit_status("Circle tool — click to place center")
-        elif mode == SketchToolMode.NONE:
-            self._emit_status("Ready")
+            self._emit_status("Circle — click to place center")
+        elif mode in (SketchToolMode.NONE, SketchToolMode.SELECT):
+            self._emit_status("Select — click and drag points to move")
         else:
             self._emit_status(f"{mode.name.title()} tool active")
 
+    def activate_select(self):
+        """Switch to select mode (the default)."""
+        self.activate_tool(SketchToolMode.SELECT)
+
     def deactivate(self):
-        """Deactivate whatever tool is active."""
-        self.activate_tool(SketchToolMode.NONE)
+        """Deactivate whatever tool is active, returning to select."""
+        self.activate_tool(SketchToolMode.SELECT)
+
+    @property
+    def is_select_mode(self) -> bool:
+        """True when in select/drag mode (no drawing tool active)."""
+        return self._active_tool in (SketchToolMode.NONE, SketchToolMode.SELECT)
 
     def on_click(self, world_x: float, world_y: float):
         """
@@ -122,7 +135,7 @@ class SketchToolManager:
         Returns the completed primitive if an action was finished,
         or ``None`` if we're still accumulating points.
         """
-        if self._active_tool == SketchToolMode.NONE:
+        if self._active_tool in (SketchToolMode.NONE, SketchToolMode.SELECT):
             return None
 
         if self._active_tool == SketchToolMode.LINE:
@@ -144,43 +157,52 @@ class SketchToolManager:
         """
         Finish the current drawing chain (Enter / right-click).
 
-        The tool stays active so the user can start another chain
-        immediately.
+        Switches back to Select mode so the user can drag points.
         """
-        if self._active_tool == SketchToolMode.LINE:
-            if self._points:
-                self._points.clear()
-                self._chain_prim_count = 0
-                self._emit_status("Line chain finished — click to start a new line")
-            # Tool remains LINE
-        elif self._active_tool == SketchToolMode.RECTANGLE:
-            self._points.clear()
-            self._chain_prim_count = 0
-            self._emit_status("Rectangle done — click to start another")
-        elif self._active_tool == SketchToolMode.CIRCLE:
-            self._points.clear()
-            self._chain_prim_count = 0
-            self._emit_status("Circle done — click to place another")
+        had_tool = self._active_tool not in (SketchToolMode.NONE, SketchToolMode.SELECT)
+        self._points.clear()
+        self._chain_prim_count = 0
+        if had_tool:
+            self._active_tool = SketchToolMode.SELECT
+            self._emit_status("Select — click and drag points to move")
         if self.on_preview_changed:
             self.on_preview_changed()
 
     def cancel(self):
         """
-        Cancel the current tool (Escape).
+        Escape behaviour (Fusion 360 style):
 
-        Removes ALL primitives created during the current chain and
-        deactivates the tool.
+        * **Line tool with segments drawn**: undo the last segment only.
+          The tool stays in LINE mode so the user can continue or press
+          Escape again to undo further.
+        * **Line tool with no segments (only the first point)**: discard
+          the first-click marker and return to Select.
+        * **Any other tool / no tool**: return to Select.
         """
-        prims_to_remove = self._chain_prim_count
-        had_tool = self._active_tool != SketchToolMode.NONE
-        self._active_tool = SketchToolMode.NONE
+        if self._active_tool == SketchToolMode.LINE:
+            if self._chain_prim_count > 0:
+                # Undo the last segment: remove the last point and tell
+                # the extension to pop one primitive.
+                self._chain_prim_count -= 1
+                if len(self._points) > 1:
+                    self._points.pop()
+                self._emit_status(
+                    "Undid last segment — click to continue, Esc again to undo more"
+                )
+                if self.on_chain_cancelled:
+                    self.on_chain_cancelled(1)
+                if self.on_preview_changed:
+                    self.on_preview_changed()
+                return
+            # No segments drawn yet — just discard the first-click marker
+            # and exit to Select.
+
+        # Fall-through for all other cases: exit to Select
+        self._active_tool = SketchToolMode.SELECT
         self._points.clear()
         self._cursor_pos = None
         self._chain_prim_count = 0
-        if had_tool:
-            self._emit_status("Tool cancelled — chain undone")
-        if prims_to_remove > 0 and self.on_chain_cancelled:
-            self.on_chain_cancelled(prims_to_remove)
+        self._emit_status("Select — click and drag points to move")
         if self.on_preview_changed:
             self.on_preview_changed()
 

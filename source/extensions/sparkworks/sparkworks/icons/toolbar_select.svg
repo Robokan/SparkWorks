@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <!-- Pointer / arrow cursor icon for Select mode -->
+  <defs>
+    <linearGradient id="arrowGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="1"/>
+      <stop offset="1" stop-color="#babdb6" stop-opacity="1"/>
+    </linearGradient>
+  </defs>
+  <!-- Arrow cursor shape -->
+  <path d="M 16,6 L 16,52 L 26,42 L 36,58 L 42,54 L 32,38 L 46,36 Z"
+        fill="url(#arrowGrad)" stroke="#3f3f3f" stroke-width="2.5"
+        stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

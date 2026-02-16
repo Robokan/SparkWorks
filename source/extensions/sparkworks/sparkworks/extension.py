@@ -235,6 +235,7 @@ class ParametricCadExtension(omni.ext.IExt):
         tb.on_finish_sketch = self._action_finish_sketch
         tb.on_add_plane = self._action_add_plane
         # Tool selection (not primitive creation)
+        tb.on_tool_select = self._action_tool_select
         tb.on_tool_line = self._action_tool_line
         tb.on_tool_rectangle = self._action_tool_rectangle
         tb.on_tool_circle = self._action_tool_circle
@@ -249,6 +250,14 @@ class ParametricCadExtension(omni.ext.IExt):
         tb.on_boolean_intersect = lambda: self._action_boolean("intersect")
         tb.on_rebuild_all = self._action_rebuild_all
         tb.on_clear_all = self._action_clear_all
+        # Constraint tools
+        tb.on_constraint_coincident = lambda: self._action_add_constraint("coincident")
+        tb.on_constraint_horizontal = lambda: self._action_add_constraint("horizontal")
+        tb.on_constraint_vertical = lambda: self._action_add_constraint("vertical")
+        tb.on_constraint_distance = lambda: self._action_add_constraint("distance")
+        tb.on_constraint_perpendicular = lambda: self._action_add_constraint("perpendicular")
+        tb.on_constraint_parallel = lambda: self._action_add_constraint("parallel")
+        tb.on_constraint_equal = lambda: self._action_add_constraint("equal")
 
     def _connect_timeline_panel_callbacks(self):
         tp = self._timeline_panel
@@ -279,6 +288,9 @@ class ParametricCadExtension(omni.ext.IExt):
         sv.on_viewport_click = self._on_viewport_click
         sv.on_viewport_move = self._on_viewport_move
         sv.on_viewport_key = self._on_viewport_key
+        sv.on_select_prim = self._on_viewport_select_prim
+        sv.on_drag_point_path = self._on_drag_point_path
+        sv.on_snap_join = self._on_snap_join_paths
 
     def _set_status(self, msg: str):
         self._toolbar.set_status(msg)
@@ -298,10 +310,331 @@ class ParametricCadExtension(omni.ext.IExt):
                 self._active_sketch.plane_name,
                 self._active_sketch.name,
                 len(self._active_sketch.primitives),
+                dof=self._active_sketch.degrees_of_freedom,
+                constraint_count=self._active_sketch.constraint_count,
             )
+            # Update constraint icons and connected-point highlighting
+            self._update_solver_overlays()
+            self._update_connected_paths()
         else:
             self._sketch_viewport.update_primitives([])
+            self._sketch_viewport.update_constraint_data([])
+            self._sketch_viewport.set_connected_paths(set())
             self._sketch_viewport.clear_info()
+
+    def _update_connected_paths(self):
+        """
+        Compute which point USD paths are connected via coincident constraints,
+        then push that set to the viewport so connected points draw green
+        and disconnected points draw red.
+        """
+        sketch = self._active_sketch
+        if sketch is None or sketch.solver is None:
+            self._sketch_viewport.set_connected_paths(set())
+            return
+
+        from .kernel.constraint_solver import ConstraintType as CT, EntityKind
+
+        solver = sketch.solver
+
+        # Collect all entity IDs that participate in a coincident constraint
+        coincident_eids: set = set()
+        for c in solver.constraints:
+            if c.ctype == CT.COINCIDENT:
+                for eid in c.entity_ids:
+                    e = solver.entities.get(eid)
+                    if e and e.kind == EntityKind.POINT:
+                        coincident_eids.add(eid)
+
+        # Map those entity IDs back to USD paths
+        from .kernel.sketch import SketchLine
+        connected: set = set()
+        for idx, prim in enumerate(sketch.primitives):
+            ents = sketch._prim_entities.get(idx, {})
+            if isinstance(prim, SketchLine):
+                if ents.get("p1") in coincident_eids:
+                    sp = getattr(prim, "start_usd_path", None)
+                    if sp:
+                        connected.add(sp)
+                if ents.get("p2") in coincident_eids:
+                    ep = getattr(prim, "end_usd_path", None)
+                    if ep:
+                        connected.add(ep)
+
+        self._sketch_viewport.set_connected_paths(connected)
+
+    def _update_solver_overlays(self):
+        """Push constraint icons and per-line labels to the viewport."""
+        sketch = self._active_sketch
+        if sketch is None or sketch.solver is None:
+            self._sketch_viewport.update_constraint_data([])
+            self._sketch_viewport.set_prim_constraint_labels({})
+            return
+
+        from .kernel.constraint_solver import ConstraintType as CT, EntityKind
+
+        solver = sketch.solver
+
+        # Constraint icons (positioned near geometry)
+        cdata = []
+        for c in solver.constraints:
+            icon = self._constraint_icon_data(sketch, c)
+            if icon is not None:
+                cdata.append(icon)
+        self._sketch_viewport.update_constraint_data(cdata)
+
+        # Per-primitive constraint labels (shown on the line itself)
+        # Map solver entity ID → primitive index
+        eid_to_prim: dict = {}
+        for idx, ents in sketch._prim_entities.items():
+            for key, eid in ents.items():
+                eid_to_prim[eid] = idx
+
+        label_map = {
+            CT.HORIZONTAL_LINE: "H",
+            CT.VERTICAL_LINE: "V",
+            CT.PARALLEL: "∥",
+            CT.PERPENDICULAR: "⊥",
+            CT.EQUAL_LENGTH: "=",
+            CT.DISTANCE_PP: "d",
+        }
+
+        prim_labels: dict = {}  # prim_index → [labels]
+        for c in solver.constraints:
+            label = label_map.get(c.ctype)
+            if label is None:
+                continue
+            # Add the label to every primitive referenced by this constraint
+            for eid in c.entity_ids:
+                pidx = eid_to_prim.get(eid)
+                if pidx is not None:
+                    prim_labels.setdefault(pidx, [])
+                    if label not in prim_labels[pidx]:
+                        prim_labels[pidx].append(label)
+
+        self._sketch_viewport.set_prim_constraint_labels(prim_labels)
+
+    def _constraint_icon_data(self, sketch, constraint) -> dict:
+        """Build a dict for rendering a constraint icon near the geometry."""
+        from .kernel.constraint_solver import ConstraintType, EntityKind
+        c = constraint
+        s = sketch.solver
+        if s is None:
+            return None
+
+        if not c.entity_ids:
+            return None
+
+        type_map = {
+            ConstraintType.COINCIDENT: "coincident",
+            ConstraintType.HORIZONTAL_LINE: "horizontal",
+            ConstraintType.VERTICAL_LINE: "vertical",
+            ConstraintType.PERPENDICULAR: "perpendicular",
+            ConstraintType.PARALLEL: "parallel",
+            ConstraintType.EQUAL_LENGTH: "equal",
+            ConstraintType.DISTANCE_PP: "distance",
+            ConstraintType.DISTANCE_PL: "distance",
+            ConstraintType.FIXED: "fixed",
+        }
+        ctype_str = type_map.get(c.ctype, "")
+        if not ctype_str:
+            return None
+
+        # Position the icon at the midpoint of the referenced geometry.
+        # For line entities, compute the true midpoint; for points, use
+        # the point position directly.
+        xs, ys = [], []
+        for eid in c.entity_ids:
+            e = s.entities.get(eid)
+            if e is None:
+                continue
+            pi = e.param_indices
+            if e.kind == EntityKind.LINE and len(pi) >= 4:
+                # Midpoint of the line segment
+                mx = (s._params[pi[0]] + s._params[pi[2]]) / 2.0
+                my = (s._params[pi[1]] + s._params[pi[3]]) / 2.0
+                xs.append(mx)
+                ys.append(my)
+            else:
+                xs.append(s._params[pi[0]])
+                ys.append(s._params[pi[1]])
+
+        if not xs:
+            return None
+
+        cx = sum(xs) / len(xs)
+        cy = sum(ys) / len(ys) + 2.0  # slight offset above the geometry
+
+        return {"type": ctype_str, "x": cx, "y": cy, "value": c.value}
+
+    def _on_viewport_select_prim(self, usd_path: str, add_to_selection: bool = False):
+        """Called when the user clicks a primitive/point in the sketch viewport.
+
+        Args:
+            usd_path: The USD path of the clicked prim.
+            add_to_selection: If True (Ctrl+click), add to the current
+                selection instead of replacing it.
+        """
+        try:
+            usd_context = omni.usd.get_context()
+            sel = usd_context.get_selection()
+            if add_to_selection:
+                current = list(sel.get_selected_prim_paths())
+                if usd_path in current:
+                    # Ctrl+click on already-selected → deselect it
+                    current.remove(usd_path)
+                else:
+                    current.append(usd_path)
+                sel.set_selected_prim_paths(current, True)
+            else:
+                sel.set_selected_prim_paths([usd_path], True)
+        except Exception as e:
+            print(f"[SparkWorks] Failed to select {usd_path}: {e}")
+
+    def _on_drag_point_path(self, usd_path: str, wx: float, wy: float):
+        """
+        Handle drag of a point prim in the sketch viewport.
+
+        Uses the constraint solver so that connected/constrained points
+        move together (e.g. shared endpoints between two line segments).
+        After the solver updates coordinates, ALL affected primitives are
+        synced back to USD.
+        """
+        sketch = self._active_sketch
+        if sketch is None:
+            return
+
+        # Look up the solver entity ID for this USD path
+        sketch.ensure_solver()
+        eid = sketch.get_solver_eid_for_usd_path(usd_path)
+        if eid is not None:
+            # Solver-based drag: moves connected points together
+            ok = sketch.drag_point(eid, wx, wy)
+            if ok:
+                self._sync_all_sketch_prims_to_usd()
+                self._update_sketch_view()
+        else:
+            # Fallback: direct coordinate update (no solver)
+            from .kernel.sketch import SketchLine, SketchRect
+            matched = False
+            for prim in sketch.primitives:
+                if isinstance(prim, SketchLine):
+                    if getattr(prim, "start_usd_path", None) == usd_path:
+                        prim.start = (wx, wy)
+                        matched = True
+                        break
+                    elif getattr(prim, "end_usd_path", None) == usd_path:
+                        prim.end = (wx, wy)
+                        matched = True
+                        break
+                elif isinstance(prim, SketchRect):
+                    cpaths = getattr(prim, "corner_usd_paths", None) or []
+                    for ci, cp in enumerate(cpaths):
+                        if cp == usd_path:
+                            corners = list(prim.corners)
+                            corners[ci] = (wx, wy)
+                            xs = [c[0] for c in corners]
+                            ys = [c[1] for c in corners]
+                            prim.center = ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2)
+                            prim.width = max(xs) - min(xs)
+                            prim.height = max(ys) - min(ys)
+                            matched = True
+                            break
+                    if matched:
+                        break
+            if self._bridge:
+                self._bridge.update_point_position(usd_path, wx, wy)
+            self._update_sketch_view()
+
+    def _sync_all_sketch_prims_to_usd(self):
+        """
+        After a solver update, write ALL primitives' current coordinates
+        back to their USD prims (points + parent attributes).
+        """
+        sketch = self._active_sketch
+        if sketch is None or self._bridge is None:
+            return
+        from .kernel.sketch import SketchLine, SketchRect
+        for prim in sketch.primitives:
+            if isinstance(prim, SketchLine):
+                sp = getattr(prim, "start_usd_path", None)
+                ep = getattr(prim, "end_usd_path", None)
+                if sp:
+                    self._bridge.update_point_position(sp, prim.start[0], prim.start[1])
+                if ep:
+                    self._bridge.update_point_position(ep, prim.end[0], prim.end[1])
+            elif isinstance(prim, SketchRect):
+                corner_paths = getattr(prim, "corner_usd_paths", None) or []
+                corners = prim.corners
+                for cp_path, (cx, cy) in zip(corner_paths, corners):
+                    if cp_path:
+                        self._bridge.update_point_position(cp_path, cx, cy)
+
+    def _on_snap_join_paths(self, drag_path: str, target_path: str):
+        """
+        Called when the user releases a dragged point onto a snap target.
+
+        Translates USD paths to solver entity IDs and delegates to
+        _on_snap_join for the actual constraint creation.
+        """
+        sketch = self._active_sketch
+        if sketch is None:
+            return
+        sketch.ensure_solver()
+        drag_eid = sketch.get_solver_eid_for_usd_path(drag_path)
+        target_eid = sketch.get_solver_eid_for_usd_path(target_path)
+        if drag_eid is not None and target_eid is not None:
+            self._on_snap_join(drag_eid, target_eid)
+            # After snap-join, sync all to USD
+            self._sync_all_sketch_prims_to_usd()
+
+    def _on_snap_join(self, drag_eid: int, target_eid: int):
+        """
+        Called when the user releases a dragged point on top of another.
+
+        Adds a coincident constraint so the two points stay joined,
+        then solves and redraws.
+        """
+        sketch = self._active_sketch
+        if sketch is None or sketch.solver is None:
+            return
+
+        solver = sketch.solver
+
+        # Make sure both entities are points
+        e_drag = solver.entities.get(drag_eid)
+        e_target = solver.entities.get(target_eid)
+        if e_drag is None or e_target is None:
+            return
+        from .kernel.constraint_solver import EntityKind
+        if e_drag.kind != EntityKind.POINT or e_target.kind != EntityKind.POINT:
+            return
+
+        # Check if a coincident constraint between these two already exists
+        from .kernel.constraint_solver import ConstraintType as CT
+        for c in solver.constraints:
+            if c.ctype != CT.COINCIDENT:
+                continue
+            pair = set(c.entity_ids)
+            if pair == {drag_eid, target_eid}:
+                return  # already joined
+
+        # Snap the dragged point to the target's position
+        tx, ty = solver.get_point(target_eid)
+        solver.set_point(drag_eid, tx, ty)
+
+        # Add a coincident constraint
+        solver.constrain_coincident(drag_eid, target_eid)
+        sketch.solve_constraints()
+        self._update_sketch_view()
+
+        # Persist
+        if self._bridge:
+            self._bridge.save_sketches(self._sketch_registry)
+
+        self._set_status(
+            f"Joined points — DOF: {sketch.degrees_of_freedom}"
+        )
 
     def _get_sketch_hidden_indices(self, sketch: Sketch) -> set:
         """Query USD visibility for each primitive prim under the sketch."""
@@ -485,6 +818,12 @@ class ParametricCadExtension(omni.ext.IExt):
         paths = selection.get_selected_prim_paths()
 
         if not paths:
+            # Nothing selected — hide sketch/constraint/op/bool tools;
+            # the Create Sketch button remains visible via the toolbar widget.
+            self._toolbar.set_draw_tools_visible(False)
+            self._toolbar.set_constraint_tools_visible(False)
+            self._toolbar.set_op_tools_visible(False)
+            self._toolbar.set_bool_tools_visible(False)
             return
 
         # ── Classify every selected path ──────────────────────────────
@@ -495,6 +834,12 @@ class ParametricCadExtension(omni.ext.IExt):
         detected_sketch_name: Optional[str] = None
         other_plane: Optional[ConstructionPlane] = None
         tl_name: Optional[str] = None
+
+        # Fine-grained sketch prim classification for constraint toolbar
+        # "sketch_root" = clicked the Sketch Xform itself
+        # "line" = clicked a Line primitive (e.g. .../Primitives/Line_000)
+        # "point" = clicked a point sub-prim (e.g. .../Line_000/StartPt)
+        sketch_sel_types: List[str] = []   # one entry per selected sketch-child
 
         sk_prefix = self._bridge.sketches_root + "/"
 
@@ -523,13 +868,33 @@ class ParametricCadExtension(omni.ext.IExt):
                 selected_bodies.append(body_name)
                 continue
 
-            # Sketch prim (the Sketch Xform itself or a child like Primitives)
+            # Sketch prim (the Sketch Xform itself, a Primitive, or a Point child)
             if path.startswith(sk_prefix):
                 remainder = path[len(sk_prefix):]
                 sk_name = remainder.split("/")[0]
                 # Ignore Profiles children — those are handled above
                 if "/Profiles/" not in path:
                     selected_sketch = sk_name
+                    # Determine what KIND of sketch element was selected
+                    parts = remainder.split("/")  # e.g. ["Sketch1","Primitives","Line_000","StartPt"]
+                    if "/Primitives/" in path:
+                        prim_part = parts[2] if len(parts) > 2 else ""
+                        # Is it a point sub-prim?
+                        # Lines have StartPt/EndPt; Rects have CornerBL/BR/TR/TL
+                        point_names = ("StartPt", "EndPt",
+                                       "CornerBL", "CornerBR", "CornerTR", "CornerTL")
+                        if len(parts) > 3 and parts[3] in point_names:
+                            sketch_sel_types.append("point")
+                        elif prim_part.startswith("Line"):
+                            sketch_sel_types.append("line")
+                        elif prim_part.startswith("Rect"):
+                            sketch_sel_types.append("rect")
+                        elif prim_part.startswith("Circle"):
+                            sketch_sel_types.append("circle")
+                        else:
+                            sketch_sel_types.append("other")
+                    else:
+                        sketch_sel_types.append("sketch_root")
                 continue
 
             # Timeline feature
@@ -546,7 +911,8 @@ class ParametricCadExtension(omni.ext.IExt):
 
         # ── Act on classification ─────────────────────────────────────
         # Hide all tool groups first; the matching branch re-shows the right one.
-        self._toolbar.set_sketch_tools_visible(False)
+        self._toolbar.set_draw_tools_visible(False)
+        self._toolbar.set_constraint_tools_visible(False)
         self._toolbar.set_op_tools_visible(False)
         self._toolbar.set_bool_tools_visible(False)
 
@@ -575,20 +941,52 @@ class ParametricCadExtension(omni.ext.IExt):
         if selected_sketch:
             self._selected_face_name = None
             self._selected_profile_indices = set()
+            # Look up from registry first; fall back to the actively-edited
+            # sketch which may not be registered yet (not finished).
             sketch_obj = self._sketch_registry.get(selected_sketch) if self._sketch_registry else None
+            if sketch_obj is None and self._active_sketch is not None:
+                if self._active_sketch.name == selected_sketch:
+                    sketch_obj = self._active_sketch
             if sketch_obj:
+                already_editing = (self._active_sketch is sketch_obj)
                 self._active_sketch = sketch_obj
+                # Ensure the constraint solver is initialised so drag
+                # handles appear and the user can interact with points.
+                sketch_obj.ensure_solver()
                 # Find the feature index for this sketch
                 for i, f in enumerate(self._timeline.features):
                     if f.sketch_id == selected_sketch:
                         self._editing_feature_index = i
                         break
                 self._toolbar.set_sketch_mode(True)
-                self._toolbar.set_plane_hint(f"Editing '{selected_sketch}' — select a drawing tool")
-                self._bridge.hide_all_sketches(except_sketch=selected_sketch)
-                self._show_sketch_in_viewport(sketch_obj)
-                self._refresh_profile_overlays_for_active_sketch()
-                self._focus_sketch_view()
+                if not already_editing:
+                    # Only reset tool state when entering a NEW sketch;
+                    # don't interrupt active drawing/constraint workflows.
+                    self._toolbar.set_plane_hint(f"Editing '{selected_sketch}' — select a drawing tool")
+                    self._bridge.hide_all_sketches(except_sketch=selected_sketch)
+                    self._sketch_tool.deactivate()
+                    self._toolbar.set_active_tool(None)
+                    self._sketch_viewport.set_select_mode(True)
+                    self._focus_sketch_view()
+
+                # ── Show only applicable constraint buttons ──
+                self._toolbar.set_applicable_constraints(
+                    self._get_applicable_constraints(sketch_sel_types)
+                )
+
+                # Explicitly ensure draw tools are visible — redundant with
+                # set_sketch_mode(True) but guards against framework rebuilds.
+                self._toolbar.set_draw_tools_visible(True)
+
+                self._update_sketch_view()
+                # Forward selected paths to the viewport for highlighting
+                self._sketch_viewport.set_selected_paths(set(paths))
+                if not already_editing:
+                    self._refresh_profile_overlays_for_active_sketch()
+            else:
+                # Sketch not in registry — might happen after a reload.
+                # Still show the sketch button as active so user can finish.
+                print(f"[SparkWorks] WARNING: sketch '{selected_sketch}' not in registry")
             return
 
         # 3) Body selected → boolean tools
@@ -670,6 +1068,13 @@ class ParametricCadExtension(omni.ext.IExt):
         self._toolbar.set_plane_hint("Click a plane in the viewport to start a sketch")
         self._sketch_tool.deactivate()
         self._toolbar.set_active_tool(None)
+
+        # Clear the sketch viewport so it doesn't show stale geometry
+        self._sketch_viewport.update_primitives([])
+        self._sketch_viewport.update_constraint_data([])
+        self._sketch_viewport.set_selected_paths(set())
+        self._sketch_viewport.clear_info()
+        self._sketch_viewport.clear_preview()
 
         # 4) Re-subscribe ObjectsChanged for the new stage
         self._subscribe_objects_changed()
@@ -1051,11 +1456,14 @@ class ParametricCadExtension(omni.ext.IExt):
             plane_name=plane.plane_type,
             construction_plane=plane,
         )
+        # Auto-enable the constraint solver so point handles are available
+        self._active_sketch.ensure_solver()
         self._editing_feature_index = None  # brand-new sketch, not editing
         self._toolbar.set_sketch_mode(True)
         self._toolbar.set_plane_hint(f"Sketching on {plane.name}")
-        self._sketch_tool.deactivate()
+        self._sketch_tool.deactivate()  # starts in Select mode
         self._toolbar.set_active_tool(None)
+        self._sketch_viewport.set_select_mode(True)
         self._update_sketch_view()
 
         # Hide other sketches' primitives to reduce clutter (Fusion 360 style).
@@ -1086,9 +1494,16 @@ class ParametricCadExtension(omni.ext.IExt):
             return
 
         if button == 0:  # Left click — draw
+            # Also update cursor position so the rubber-band preview has
+            # an initial reference even before the _on_update loop fires.
+            self._sketch_tool.on_mouse_move(world_x, world_y)
             self._sketch_tool.on_click(world_x, world_y)
-        elif button == 1:  # Right click — finish chain
+        elif button == 1:  # Right click — finish chain, return to select
             self._sketch_tool.on_finish()
+            self._toolbar.set_active_tool(None)
+            self._sketch_viewport.set_select_mode(True)
+            self._update_sketch_view()
+            self._select_active_sketch_in_stage()
 
     def _on_viewport_move(self, world_x: float, world_y: float):
         """Handle mouse movement in the sketch viewport."""
@@ -1102,9 +1517,35 @@ class ParametricCadExtension(omni.ext.IExt):
             return
         if key in (KEY_ENTER, KEY_NUMPAD_ENTER):
             self._sketch_tool.on_finish()
+            self._toolbar.set_active_tool(None)
+            self._sketch_viewport.set_select_mode(True)
+            self._update_sketch_view()  # refresh solver point handles
+            self._select_active_sketch_in_stage()
         elif key == KEY_ESCAPE:
             self._sketch_tool.cancel()
-            self._toolbar.set_active_tool(None)
+            # If cancel() left the tool active (undo-one-segment), keep
+            # the toolbar showing the line tool.  Otherwise switch to select.
+            if self._sketch_tool.is_select_mode:
+                self._toolbar.set_active_tool(None)
+                self._sketch_viewport.set_select_mode(True)
+                self._select_active_sketch_in_stage()
+            self._update_sketch_view()
+
+    def _select_active_sketch_in_stage(self):
+        """Select the active sketch's root prim in the USD stage.
+
+        This triggers ``_on_stage_event`` which shows the correct toolbar
+        state (draw tools visible, constraints hidden).
+        """
+        if self._active_sketch is None or self._bridge is None:
+            return
+        sketch_path = f"{self._bridge.sketches_root}/{self._active_sketch.name}"
+        try:
+            omni.usd.get_context().get_selection().set_selected_prim_paths(
+                [sketch_path], True
+            )
+        except Exception:
+            pass
 
     # ========================================================================
     # Sketch Tool Events
@@ -1134,6 +1575,29 @@ class ParametricCadExtension(omni.ext.IExt):
             )
 
         prim_idx = len(self._active_sketch.primitives) - 1
+        new_prim = self._active_sketch.primitives[prim_idx]
+
+        # Immediately write the new primitive to USD
+        if self._bridge:
+            sketch_path = (
+                f"{self._bridge.sketches_root}/{self._active_sketch.name}"
+            )
+            usd_path = self._bridge.write_sketch_primitive(
+                sketch_path, prim_idx, new_prim
+            )
+            # Select the newly created prim in the stage
+            if usd_path:
+                try:
+                    usd_context = omni.usd.get_context()
+                    usd_context.get_selection().set_selected_prim_paths(
+                        [usd_path], True
+                    )
+                except Exception:
+                    pass
+
+        # Auto-detect constraints on the newly created primitive
+        self._auto_constrain(prim_idx)
+
         self._update_sketch_view()
 
         # Show the new primitive's properties in the panel
@@ -1144,6 +1608,14 @@ class ParametricCadExtension(omni.ext.IExt):
         # Refresh profile overlays so the 3D viewport stays up-to-date
         if self._editing_feature_index is not None:
             self._refresh_profile_overlays_for_active_sketch()
+
+        # For single-shot tools (rectangle, circle), switch back to select
+        # mode and select the sketch so the draw toolbar stays visible.
+        if not isinstance(primitive, SketchLine):
+            self._sketch_tool.on_finish()
+            self._toolbar.set_active_tool(None)
+            self._sketch_viewport.set_select_mode(True)
+            self._select_active_sketch_in_stage()
 
     def _on_tool_preview_changed(self):
         """Called when the rubber-band preview or placed-points change."""
@@ -1174,9 +1646,19 @@ class ParametricCadExtension(omni.ext.IExt):
         """
         if self._active_sketch is None or count <= 0:
             return
-        prims = self._active_sketch.primitives
+        sketch = self._active_sketch
+        prims = sketch.primitives
         for _ in range(min(count, len(prims))):
             prims.pop()
+
+        # Rebuild the solver so its entity registry matches the trimmed
+        # primitive list (entities for removed primitives are discarded).
+        if sketch.solver is not None:
+            from .kernel.constraint_solver import ConstraintSolver
+            sketch.solver = ConstraintSolver()
+            sketch._prim_entities = {}
+            sketch._register_all_primitives()
+
         self._update_sketch_view()
         self._property_panel._show_no_selection()
         # Refresh profiles after undo
@@ -1337,6 +1819,14 @@ class ParametricCadExtension(omni.ext.IExt):
 
     # -- Tool activation (interactive drawing) --------------------------------
 
+    def _action_tool_select(self):
+        """Switch to select / drag mode (deactivate any drawing tool)."""
+        self._sketch_tool.deactivate()
+        self._toolbar.set_active_tool(None)  # highlights select button
+        self._sketch_viewport.set_select_mode(True)
+        self._sketch_viewport.clear_preview()
+        self._update_sketch_view()
+
     def _action_tool_line(self):
         if self._active_sketch is None:
             self._set_status("Click a construction plane first to start a sketch")
@@ -1344,6 +1834,7 @@ class ParametricCadExtension(omni.ext.IExt):
             return
         self._sketch_tool.activate_tool(SketchToolMode.LINE)
         self._toolbar.set_active_tool("line")
+        self._sketch_viewport.set_select_mode(False)
 
     def _action_tool_rectangle(self):
         if self._active_sketch is None:
@@ -1352,6 +1843,7 @@ class ParametricCadExtension(omni.ext.IExt):
             return
         self._sketch_tool.activate_tool(SketchToolMode.RECTANGLE)
         self._toolbar.set_active_tool("rectangle")
+        self._sketch_viewport.set_select_mode(False)
 
     def _action_tool_circle(self):
         if self._active_sketch is None:
@@ -1360,6 +1852,295 @@ class ParametricCadExtension(omni.ext.IExt):
             return
         self._sketch_tool.activate_tool(SketchToolMode.CIRCLE)
         self._toolbar.set_active_tool("circle")
+        self._sketch_viewport.set_select_mode(False)
+
+    # -- Auto-constraints (FreeCAD-style) --------------------------------------
+
+    @staticmethod
+    def _get_applicable_constraints(sel_types: List[str]) -> set:
+        """
+        Given a list of selected sketch-element types (e.g. ["line", "line"]
+        or ["point", "point"]), return the set of constraint button names
+        that are applicable.
+
+        Rules:
+        - sketch_root only, or empty → no constraints (just drawing tools)
+        - 1 line → horizontal, vertical, distance
+        - 2+ lines → + parallel, perpendicular, equal
+        - 1 point → (nothing specific)
+        - 2+ points → coincident, distance
+        - 1 line + 1 point → distance
+        - mix of lines and points → coincident, distance + line constraints
+        """
+        if not sel_types:
+            return set()
+
+        # Filter out sketch_root — those don't contribute to constraints
+        elem_types = [t for t in sel_types if t != "sketch_root"]
+        if not elem_types:
+            return set()
+
+        n_lines = elem_types.count("line")
+        n_points = elem_types.count("point")
+        n_rects = elem_types.count("rect")
+        n_circles = elem_types.count("circle")
+
+        applicable: set = set()
+
+        # Single line selected
+        if n_lines >= 1:
+            applicable.update({"horizontal", "vertical", "distance"})
+
+        # Two or more lines
+        if n_lines >= 2:
+            applicable.update({"parallel", "perpendicular", "equal"})
+
+        # Two or more points
+        if n_points >= 2:
+            applicable.update({"coincident", "distance"})
+
+        # A point + something else (for distance)
+        if n_points >= 1 and (n_lines + n_rects + n_circles) >= 1:
+            applicable.add("distance")
+
+        # A single point by itself — no constraints shown
+        # (user needs to select a second element)
+
+        return applicable
+
+    def _auto_constrain(self, prim_idx: int):
+        """
+        Automatically detect and apply constraints on a newly created primitive.
+
+        FreeCAD's Sketcher does this: when you draw a line that's nearly
+        horizontal/vertical, it auto-constrains.  When you click near an
+        existing point, it auto-applies coincident.
+
+        Thresholds are in sketch-local units (mm).
+        """
+        sketch = self._active_sketch
+        if sketch is None:
+            return
+
+        # Ensure solver is active
+        solver = sketch.ensure_solver()
+        ents = sketch.get_entity_ids_for_primitive(prim_idx)
+        if not ents:
+            return
+
+        from .kernel.sketch import SketchLine
+        from .kernel.constraint_solver import ConstraintType
+
+        prim = sketch.primitives[prim_idx]
+
+        ANGLE_TOL = 3.0  # degrees: lines within 3° of H/V get constrained
+        SNAP_TOL = 2.0   # mm: points within 2mm of each other snap
+
+        if isinstance(prim, SketchLine) and "line" in ents:
+            lid = ents["line"]
+            p1_eid = ents["p1"]
+            p2_eid = ents["p2"]
+
+            # Auto horizontal/vertical
+            dx = prim.end[0] - prim.start[0]
+            dy = prim.end[1] - prim.start[1]
+            import math
+            angle = math.degrees(math.atan2(abs(dy), abs(dx)))
+            if angle < ANGLE_TOL:
+                solver.constrain_horizontal(lid)
+            elif angle > (90 - ANGLE_TOL):
+                solver.constrain_vertical(lid)
+
+            # Auto coincident: check if start/end of this line is near
+            # any existing point in the solver
+            for other_idx, other_ents in sketch._prim_entities.items():
+                if other_idx == prim_idx:
+                    continue
+                for other_key, other_eid in other_ents.items():
+                    if other_key.startswith("p") and other_eid != p1_eid and other_eid != p2_eid:
+                        try:
+                            ox, oy = solver.get_point(other_eid)
+                        except (KeyError, IndexError):
+                            continue
+                        # Check distance to p1
+                        d1 = math.hypot(prim.start[0] - ox, prim.start[1] - oy)
+                        if d1 < SNAP_TOL:
+                            solver.constrain_coincident(p1_eid, other_eid)
+                        # Check distance to p2
+                        d2 = math.hypot(prim.end[0] - ox, prim.end[1] - oy)
+                        if d2 < SNAP_TOL:
+                            solver.constrain_coincident(p2_eid, other_eid)
+
+            # Solve after auto-constraints
+            sketch.solve_constraints()
+
+    # -- Constraint tools (sketch mode) ----------------------------------------
+
+    def _action_add_constraint(self, ctype_name: str):
+        """
+        Apply a constraint to the active sketch based on USD stage selection.
+
+        Uses the currently selected USD prims to determine which solver
+        entities to constrain.  For pair constraints (coincident, perpendicular,
+        parallel, equal) two prims must be selected.  For single-entity
+        constraints (horizontal, vertical, distance) one line prim suffices.
+        Falls back to last-drawn primitives when nothing is selected.
+        """
+        from .kernel.constraint_solver import ConstraintType
+
+        sketch = self._active_sketch
+        if sketch is None:
+            _notify("No active sketch — create one first.", "warning")
+            return
+
+        solver = sketch.ensure_solver()
+
+        n = len(sketch.primitives)
+        if n == 0:
+            _notify("Sketch has no primitives.", "warning")
+            return
+
+        # ------- Resolve selected entities from stage selection -------
+        sel_eids: list = []       # solver entity IDs for selected points
+        sel_line_eids: list = []  # solver entity IDs for selected lines
+        sel_prim_ents: list = []  # per-selected-prim entity dicts
+
+        try:
+            sel_paths = list(
+                omni.usd.get_context().get_selection().get_selected_prim_paths()
+            )
+        except Exception:
+            sel_paths = []
+
+        if sel_paths:
+            for path in sel_paths:
+                # Check if it maps to a point entity
+                eid = sketch.get_solver_eid_for_usd_path(path)
+                if eid is not None:
+                    sel_eids.append(eid)
+                    continue
+                # Check if it maps to a whole primitive (line, rect, circle)
+                for idx, prim in enumerate(sketch.primitives):
+                    up = getattr(prim, "usd_path", None)
+                    if up == path:
+                        ents = sketch.get_entity_ids_for_primitive(idx)
+                        if ents:
+                            sel_prim_ents.append(ents)
+                            if "line" in ents:
+                                sel_line_eids.append(ents["line"])
+                        break
+
+        # Fallback: use last-drawn primitives when nothing is stage-selected
+        if not sel_eids and not sel_line_eids and not sel_prim_ents:
+            last_ents = sketch.get_entity_ids_for_primitive(n - 1)
+            prev_ents = sketch.get_entity_ids_for_primitive(n - 2) if n >= 2 else {}
+            sel_prim_ents = [last_ents] + ([prev_ents] if prev_ents else [])
+            if "line" in last_ents:
+                sel_line_eids.append(last_ents["line"])
+            if "line" in prev_ents:
+                sel_line_eids.append(prev_ents["line"])
+            for key in ("p1", "p2"):
+                if key in last_ents:
+                    sel_eids.append(last_ents[key])
+            for key in ("p1", "p2"):
+                if key in prev_ents:
+                    sel_eids.append(prev_ents[key])
+
+        # ------- Apply the requested constraint type -------
+
+        if ctype_name == "coincident":
+            if len(sel_eids) >= 2:
+                solver.constrain_coincident(sel_eids[0], sel_eids[1])
+            elif len(sel_prim_ents) >= 2:
+                p_a = sel_prim_ents[0].get("p2") or sel_prim_ents[0].get("p1")
+                p_b = sel_prim_ents[1].get("p1") or sel_prim_ents[1].get("p2")
+                if p_a is not None and p_b is not None:
+                    solver.constrain_coincident(p_a, p_b)
+                else:
+                    _notify("Select two points or line endpoints.", "warning")
+                    return
+            else:
+                _notify("Select two points for coincident.", "warning")
+                return
+
+        elif ctype_name == "horizontal":
+            lid = sel_line_eids[0] if sel_line_eids else None
+            if lid is None and sel_prim_ents:
+                lid = sel_prim_ents[0].get("line") or sel_prim_ents[0].get("l0")
+            if lid is not None:
+                solver.constrain_horizontal(lid)
+            else:
+                _notify("Select a line to constrain.", "warning")
+                return
+
+        elif ctype_name == "vertical":
+            lid = sel_line_eids[0] if sel_line_eids else None
+            if lid is None and sel_prim_ents:
+                lid = sel_prim_ents[0].get("line") or sel_prim_ents[0].get("l1")
+            if lid is not None:
+                solver.constrain_vertical(lid)
+            else:
+                _notify("Select a line to constrain.", "warning")
+                return
+
+        elif ctype_name == "distance":
+            if len(sel_eids) >= 2:
+                p1 = solver.get_point(sel_eids[0])
+                p2 = solver.get_point(sel_eids[1])
+                import math
+                d = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+                solver.constrain_distance_pp(sel_eids[0], sel_eids[1], d)
+            elif sel_prim_ents and "p1" in sel_prim_ents[0] and "p2" in sel_prim_ents[0]:
+                ents = sel_prim_ents[0]
+                p1 = solver.get_point(ents["p1"])
+                p2 = solver.get_point(ents["p2"])
+                import math
+                d = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+                solver.constrain_distance_pp(ents["p1"], ents["p2"], d)
+            else:
+                _notify("Select a line or two points for distance.", "warning")
+                return
+
+        elif ctype_name == "perpendicular":
+            if len(sel_line_eids) >= 2:
+                solver.constrain_perpendicular(sel_line_eids[0], sel_line_eids[1])
+            else:
+                _notify("Select two lines for perpendicular.", "warning")
+                return
+
+        elif ctype_name == "parallel":
+            if len(sel_line_eids) >= 2:
+                print(f"[SparkWorks] Adding parallel constraint: line eids {sel_line_eids[0]}, {sel_line_eids[1]}")
+                solver.constrain_parallel(sel_line_eids[0], sel_line_eids[1])
+            else:
+                print(f"[SparkWorks] Parallel failed: sel_line_eids={sel_line_eids}, sel_eids={sel_eids}, sel_prim_ents={sel_prim_ents}")
+                _notify("Select two lines for parallel.", "warning")
+                return
+
+        elif ctype_name == "equal":
+            if len(sel_line_eids) >= 2:
+                solver.constrain_equal_length(sel_line_eids[0], sel_line_eids[1])
+            else:
+                _notify("Select two lines for equal length.", "warning")
+                return
+        else:
+            return
+
+        # Solve and update the view
+        ok = sketch.solve_constraints()
+        print(f"[SparkWorks] Constraint '{ctype_name}' solve: {'OK' if ok else 'FAILED'}  DOF={sketch.degrees_of_freedom}")
+        self._sync_all_sketch_prims_to_usd()
+        self._update_sketch_view()
+
+        # Persist updated sketch
+        if self._bridge:
+            self._bridge.save_sketches(self._sketch_registry)
+
+        status = f"{ctype_name.title()} constraint added"
+        if not ok:
+            status += " (solver could not fully satisfy)"
+        status += f"  (DOF: {sketch.degrees_of_freedom})"
+        self._set_status(status)
 
     # -- 3D operations --------------------------------------------------------
 

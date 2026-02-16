@@ -434,6 +434,232 @@ class TestBoolean(unittest.TestCase):
         self.assertEqual(len(self.api.bodies), 1)
 
 
+class TestConstraintSolver(unittest.TestCase):
+    """Tests for the geometric constraint solver."""
+
+    def test_solver_basic(self):
+        """Solver can constrain a horizontal line distance."""
+        from sparkworks.kernel.constraint_solver import ConstraintSolver, ConstraintType
+        s = ConstraintSolver()
+        p1 = s.add_point(0, 0.1)   # slightly off horizontal
+        p2 = s.add_point(10.3, -0.2)
+        lid = s.add_line(p1, p2)
+        s.constrain_horizontal(lid)
+        s.constrain_distance_pp(p1, p2, 10.0)
+        s.fix_point(p1)
+        ok = s.solve()
+        self.assertTrue(ok)
+        x1, y1 = s.get_point(p1)
+        x2, y2 = s.get_point(p2)
+        self.assertAlmostEqual(y1, y2, places=4)
+        self.assertAlmostEqual(abs(x2 - x1), 10.0, places=3)
+
+    def test_solver_perpendicular(self):
+        """Two lines can be constrained perpendicular."""
+        from sparkworks.kernel.constraint_solver import ConstraintSolver, ConstraintType
+        s = ConstraintSolver()
+        l1, p1, p2 = s.add_line_from_coords(0, 0, 10, 0.5)
+        l2, p3, p4 = s.add_line_from_coords(5, 0, 5.3, 10)
+        s.fix_point(p1)
+        s.constrain_perpendicular(l1, l2)
+        ok = s.solve()
+        self.assertTrue(ok)
+        # Verify perpendicularity: dot product of direction vectors should be ~0
+        pa, pb = s.get_line_points(l1)
+        pc, pd = s.get_line_points(l2)
+        dx1 = pb[0] - pa[0]
+        dy1 = pb[1] - pa[1]
+        dx2 = pd[0] - pc[0]
+        dy2 = pd[1] - pc[1]
+        dot = dx1 * dx2 + dy1 * dy2
+        self.assertAlmostEqual(dot, 0.0, places=3)
+
+    def test_solver_coincident(self):
+        """Coincident constraint snaps two points together."""
+        from sparkworks.kernel.constraint_solver import ConstraintSolver
+        s = ConstraintSolver()
+        p1 = s.add_point(0, 0)
+        p2 = s.add_point(5, 5)
+        p3 = s.add_point(5.1, 4.9)  # nearly same as p2
+        s.fix_point(p1)
+        s.constrain_coincident(p2, p3)
+        ok = s.solve()
+        self.assertTrue(ok)
+        x2, y2 = s.get_point(p2)
+        x3, y3 = s.get_point(p3)
+        self.assertAlmostEqual(x2, x3, places=4)
+        self.assertAlmostEqual(y2, y3, places=4)
+
+    def test_solver_parallel(self):
+        """Parallel constraint makes two lines have the same direction."""
+        from sparkworks.kernel.constraint_solver import ConstraintSolver
+        s = ConstraintSolver()
+        l1, p1, p2 = s.add_line_from_coords(0, 0, 10, 1)
+        l2, p3, p4 = s.add_line_from_coords(0, 5, 10, 6.5)
+        s.fix_point(p1)
+        s.fix_point(p3)
+        s.constrain_parallel(l1, l2)
+        ok = s.solve()
+        self.assertTrue(ok)
+        # Verify parallel: cross product should be ~0
+        pa, pb = s.get_line_points(l1)
+        pc, pd = s.get_line_points(l2)
+        dx1 = pb[0] - pa[0]
+        dy1 = pb[1] - pa[1]
+        dx2 = pd[0] - pc[0]
+        dy2 = pd[1] - pc[1]
+        cross = dx1 * dy2 - dy1 * dx2
+        self.assertAlmostEqual(cross, 0.0, places=2)
+
+    def test_solver_equal_length(self):
+        """Equal length constraint."""
+        from sparkworks.kernel.constraint_solver import ConstraintSolver
+        import math
+        s = ConstraintSolver()
+        l1, p1, p2 = s.add_line_from_coords(0, 0, 7, 0)
+        l2, p3, p4 = s.add_line_from_coords(0, 5, 12, 5)
+        s.fix_point(p1)
+        s.fix_point(p3)
+        s.constrain_equal_length(l1, l2)
+        ok = s.solve()
+        self.assertTrue(ok)
+        pa, pb = s.get_line_points(l1)
+        pc, pd = s.get_line_points(l2)
+        len1 = math.hypot(pb[0] - pa[0], pb[1] - pa[1])
+        len2 = math.hypot(pd[0] - pc[0], pd[1] - pc[1])
+        self.assertAlmostEqual(len1, len2, places=3)
+
+    def test_solver_serialise_roundtrip(self):
+        """Solver state survives to_dict / from_dict."""
+        from sparkworks.kernel.constraint_solver import ConstraintSolver
+        s = ConstraintSolver()
+        p1 = s.add_point(0, 0)
+        p2 = s.add_point(10, 0)
+        lid = s.add_line(p1, p2)
+        cid = s.constrain_horizontal(lid)
+        d = s.to_dict()
+        s2 = ConstraintSolver.from_dict(d)
+        self.assertEqual(len(s2.entities), len(s.entities))
+        self.assertEqual(len(s2.constraints), len(s.constraints))
+        self.assertAlmostEqual(s2._params[0], 0.0)
+        self.assertAlmostEqual(s2._params[2], 10.0)
+
+    def test_solver_circle_radius(self):
+        """Radius constraint on a circle."""
+        from sparkworks.kernel.constraint_solver import ConstraintSolver
+        s = ConstraintSolver()
+        cid, center = s.add_circle(5, 5, 3.0)
+        s.fix_point(center)
+        s.constrain_radius(cid, 7.0)
+        ok = s.solve()
+        self.assertTrue(ok)
+        cx, cy, r = s.get_circle(cid)
+        self.assertAlmostEqual(r, 7.0, places=3)
+
+    def test_solver_drag(self):
+        """Drag-solve: move a point while constraints hold."""
+        from sparkworks.kernel.constraint_solver import ConstraintSolver
+        s = ConstraintSolver()
+        p1 = s.add_point(0, 0)
+        p2 = s.add_point(10, 0)
+        lid = s.add_line(p1, p2)
+        s.fix_point(p1)
+        s.constrain_horizontal(lid)
+        s.constrain_distance_pp(p1, p2, 10.0)
+        ok = s.solve_drag(p2, 15, 3)  # drag p2 to (15, 3)
+        self.assertTrue(ok)
+        x2, y2 = s.get_point(p2)
+        # Line is horizontal with distance 10 from fixed p1 at (0,0).
+        # The drag target (15, 3) is infeasible, so the solver finds
+        # the nearest feasible point: (10, 0).
+        self.assertAlmostEqual(y2, 0.0, places=2)
+        import math
+        dist = math.hypot(x2, y2)
+        self.assertAlmostEqual(dist, 10.0, places=2)
+
+
+class TestSketchConstraints(unittest.TestCase):
+    """Tests for constraint integration in the Sketch class."""
+
+    def setUp(self):
+        self.api = SparkWorksAPI(use_bridge=False)
+
+    def test_enable_constraints_on_sketch(self):
+        sk = self.api.create_sketch("XY")
+        self.api.add_line(sk, (0, 0), (10, 0))
+        self.api.enable_constraints(sk)
+        self.assertIsNotNone(sk.solver)
+        self.assertEqual(len(sk.solver.entities), 3)  # 2 points + 1 line
+
+    def test_horizontal_constraint_on_sketch(self):
+        sk = self.api.create_sketch("XY")
+        self.api.add_line(sk, (0, 0), (10, 1))  # slightly non-horizontal
+        self.api.enable_constraints(sk)
+        ents = self.api.get_entity_ids(sk, 0)
+        self.api.constrain_horizontal(sk, ents["line"])
+        self.api.constrain_fixed(sk, ents["p1"], 0, 0)
+        ok = self.api.solve_sketch(sk)
+        self.assertTrue(ok)
+        # After solving, line should be horizontal
+        prim = sk.primitives[0]
+        self.assertAlmostEqual(prim.start[1], prim.end[1], places=3)
+
+    def test_distance_constraint_on_sketch(self):
+        sk = self.api.create_sketch("XY")
+        self.api.add_line(sk, (0, 0), (7, 0))
+        self.api.enable_constraints(sk)
+        ents = self.api.get_entity_ids(sk, 0)
+        self.api.constrain_fixed(sk, ents["p1"], 0, 0)
+        self.api.constrain_distance(sk, ents["p1"], ents["p2"], 15.0)
+        ok = self.api.solve_sketch(sk)
+        self.assertTrue(ok)
+        import math
+        prim = sk.primitives[0]
+        d = math.hypot(prim.end[0] - prim.start[0], prim.end[1] - prim.start[1])
+        self.assertAlmostEqual(d, 15.0, places=2)
+
+    def test_coincident_connects_lines(self):
+        sk = self.api.create_sketch("XY")
+        self.api.add_line(sk, (0, 0), (10, 0))
+        self.api.add_line(sk, (10.2, 0.1), (20, 5))  # nearly connected
+        self.api.enable_constraints(sk)
+        e0 = self.api.get_entity_ids(sk, 0)
+        e1 = self.api.get_entity_ids(sk, 1)
+        self.api.constrain_fixed(sk, e0["p1"], 0, 0)
+        self.api.constrain_coincident(sk, e0["p2"], e1["p1"])
+        ok = self.api.solve_sketch(sk)
+        self.assertTrue(ok)
+        # End of first line should match start of second
+        p0_end = sk.primitives[0].end
+        p1_start = sk.primitives[1].start
+        self.assertAlmostEqual(p0_end[0], p1_start[0], places=3)
+        self.assertAlmostEqual(p0_end[1], p1_start[1], places=3)
+
+    def test_dof_reporting(self):
+        sk = self.api.create_sketch("XY")
+        self.api.add_line(sk, (0, 0), (10, 0))
+        self.api.enable_constraints(sk)
+        # 4 params (2 points) - 0 constraints = 4 DOF
+        self.assertEqual(self.api.get_sketch_dof(sk), 4)
+        ents = self.api.get_entity_ids(sk, 0)
+        self.api.constrain_horizontal(sk, ents["line"])
+        # 4 params - 1 constraint = 3 DOF
+        self.assertEqual(self.api.get_sketch_dof(sk), 3)
+
+    def test_constraint_persistence(self):
+        """Constraints survive sketch to_dict / from_dict."""
+        from sparkworks.kernel.sketch import Sketch
+        sk = Sketch(name="Test", plane_name="XY")
+        sk.add_line((0, 0), (10, 0))
+        sk.ensure_solver()
+        ents = sk.get_entity_ids_for_primitive(0)
+        sk.solver.constrain_horizontal(ents["line"])
+        d = sk.to_dict()
+        sk2 = Sketch.from_dict(d)
+        self.assertIsNotNone(sk2.solver)
+        self.assertEqual(len(sk2.solver.constraints), 1)
+
+
 class TestEdgeCases(unittest.TestCase):
     """Edge cases and error handling."""
 

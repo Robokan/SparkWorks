@@ -1255,53 +1255,168 @@ class UsdBridge:
             self._set_attr(prim, f"{NS}:planeNormalY", float(normal[1]), Sdf.ValueTypeNames.Double)
             self._set_attr(prim, f"{NS}:planeNormalZ", float(normal[2]), Sdf.ValueTypeNames.Double)
 
-        # Create Primitives Xform
+        # Create Primitives Xform and write each primitive (with point sub-prims)
         prims_path = f"{prim_path}/Primitives"
         UsdGeom.Xform.Define(stage, prims_path)
 
+        for i, p in enumerate(sketch.primitives):
+            self._write_single_prim_to_usd(stage, prims_path, i, p)
+
+    # -- Single-primitive immediate write ------------------------------------
+
+    def write_sketch_primitive(self, sketch_path: str, prim_index: int, primitive) -> str:
+        """
+        Write a single sketch primitive to USD immediately.
+
+        Creates the appropriate Xform prim under ``sketch_path/Primitives/``
+        and returns its USD path.  For lines, also creates ``StartPt`` and
+        ``EndPt`` child prims.  For rectangles, creates ``CornerBL/BR/TR/TL``
+        child prims.  Sets ``primitive.usd_path`` and point sub-prim paths.
+        """
+        if not USD_AVAILABLE:
+            return ""
+        stage = self._get_stage()
+        if stage is None:
+            return ""
+
         from ..kernel.sketch import SketchLine, SketchRect, SketchCircle, SketchArc
 
-        for i, p in enumerate(sketch.primitives):
-            if isinstance(p, SketchLine):
-                child_path = f"{prims_path}/Line_{i:03d}"
-                child_xf = UsdGeom.Xform.Define(stage, child_path)
-                cp = child_xf.GetPrim()
-                self._set_attr(cp, f"{NS}:type", "line", Sdf.ValueTypeNames.String)
-                self._set_attr(cp, f"{NS}:startX", float(p.start[0]), Sdf.ValueTypeNames.Double)
-                self._set_attr(cp, f"{NS}:startY", float(p.start[1]), Sdf.ValueTypeNames.Double)
-                self._set_attr(cp, f"{NS}:endX", float(p.end[0]), Sdf.ValueTypeNames.Double)
-                self._set_attr(cp, f"{NS}:endY", float(p.end[1]), Sdf.ValueTypeNames.Double)
+        prims_path = f"{sketch_path}/Primitives"
+        UsdGeom.Xform.Define(stage, prims_path)
 
-            elif isinstance(p, SketchRect):
-                child_path = f"{prims_path}/Rect_{i:03d}"
-                child_xf = UsdGeom.Xform.Define(stage, child_path)
-                cp = child_xf.GetPrim()
-                self._set_attr(cp, f"{NS}:type", "rectangle", Sdf.ValueTypeNames.String)
-                self._set_attr(cp, f"{NS}:centerX", float(p.center[0]), Sdf.ValueTypeNames.Double)
-                self._set_attr(cp, f"{NS}:centerY", float(p.center[1]), Sdf.ValueTypeNames.Double)
-                self._set_attr(cp, f"{NS}:width", float(p.width), Sdf.ValueTypeNames.Double)
-                self._set_attr(cp, f"{NS}:height", float(p.height), Sdf.ValueTypeNames.Double)
+        child_path = self._write_single_prim_to_usd(stage, prims_path, prim_index, primitive)
+        return child_path
 
-            elif isinstance(p, SketchCircle):
-                child_path = f"{prims_path}/Circle_{i:03d}"
-                child_xf = UsdGeom.Xform.Define(stage, child_path)
-                cp = child_xf.GetPrim()
-                self._set_attr(cp, f"{NS}:type", "circle", Sdf.ValueTypeNames.String)
-                self._set_attr(cp, f"{NS}:centerX", float(p.center[0]), Sdf.ValueTypeNames.Double)
-                self._set_attr(cp, f"{NS}:centerY", float(p.center[1]), Sdf.ValueTypeNames.Double)
-                self._set_attr(cp, f"{NS}:radius", float(p.radius), Sdf.ValueTypeNames.Double)
+    def _write_single_prim_to_usd(self, stage, prims_path: str, i: int, p) -> str:
+        """Create a single primitive prim and return its path."""
+        from ..kernel.sketch import SketchLine, SketchRect, SketchCircle, SketchArc
 
-            elif isinstance(p, SketchArc):
-                child_path = f"{prims_path}/Arc_{i:03d}"
-                child_xf = UsdGeom.Xform.Define(stage, child_path)
-                cp = child_xf.GetPrim()
-                self._set_attr(cp, f"{NS}:type", "arc", Sdf.ValueTypeNames.String)
-                self._set_attr(cp, f"{NS}:startX", float(p.start[0]), Sdf.ValueTypeNames.Double)
-                self._set_attr(cp, f"{NS}:startY", float(p.start[1]), Sdf.ValueTypeNames.Double)
-                self._set_attr(cp, f"{NS}:midX", float(p.mid[0]), Sdf.ValueTypeNames.Double)
-                self._set_attr(cp, f"{NS}:midY", float(p.mid[1]), Sdf.ValueTypeNames.Double)
-                self._set_attr(cp, f"{NS}:endX", float(p.end[0]), Sdf.ValueTypeNames.Double)
-                self._set_attr(cp, f"{NS}:endY", float(p.end[1]), Sdf.ValueTypeNames.Double)
+        if isinstance(p, SketchLine):
+            child_path = f"{prims_path}/Line_{i:03d}"
+            child_xf = UsdGeom.Xform.Define(stage, child_path)
+            cp = child_xf.GetPrim()
+            self._set_attr(cp, f"{NS}:type", "line", Sdf.ValueTypeNames.String)
+            self._set_attr(cp, f"{NS}:startX", float(p.start[0]), Sdf.ValueTypeNames.Double)
+            self._set_attr(cp, f"{NS}:startY", float(p.start[1]), Sdf.ValueTypeNames.Double)
+            self._set_attr(cp, f"{NS}:endX", float(p.end[0]), Sdf.ValueTypeNames.Double)
+            self._set_attr(cp, f"{NS}:endY", float(p.end[1]), Sdf.ValueTypeNames.Double)
+            # Create point child prims for selection
+            start_path = f"{child_path}/StartPt"
+            end_path = f"{child_path}/EndPt"
+            sp = UsdGeom.Xform.Define(stage, start_path).GetPrim()
+            ep = UsdGeom.Xform.Define(stage, end_path).GetPrim()
+            self._set_attr(sp, f"{NS}:type", "point", Sdf.ValueTypeNames.String)
+            self._set_attr(sp, f"{NS}:x", float(p.start[0]), Sdf.ValueTypeNames.Double)
+            self._set_attr(sp, f"{NS}:y", float(p.start[1]), Sdf.ValueTypeNames.Double)
+            self._set_attr(ep, f"{NS}:type", "point", Sdf.ValueTypeNames.String)
+            self._set_attr(ep, f"{NS}:x", float(p.end[0]), Sdf.ValueTypeNames.Double)
+            self._set_attr(ep, f"{NS}:y", float(p.end[1]), Sdf.ValueTypeNames.Double)
+            p.usd_path = child_path
+            p.start_usd_path = start_path
+            p.end_usd_path = end_path
+
+        elif isinstance(p, SketchRect):
+            child_path = f"{prims_path}/Rect_{i:03d}"
+            child_xf = UsdGeom.Xform.Define(stage, child_path)
+            cp = child_xf.GetPrim()
+            self._set_attr(cp, f"{NS}:type", "rectangle", Sdf.ValueTypeNames.String)
+            self._set_attr(cp, f"{NS}:centerX", float(p.center[0]), Sdf.ValueTypeNames.Double)
+            self._set_attr(cp, f"{NS}:centerY", float(p.center[1]), Sdf.ValueTypeNames.Double)
+            self._set_attr(cp, f"{NS}:width", float(p.width), Sdf.ValueTypeNames.Double)
+            self._set_attr(cp, f"{NS}:height", float(p.height), Sdf.ValueTypeNames.Double)
+            p.usd_path = child_path
+            # Create corner point sub-prims (BL, BR, TR, TL)
+            corner_names = ["CornerBL", "CornerBR", "CornerTR", "CornerTL"]
+            corners = p.corners
+            p.corner_usd_paths = []
+            for ci, (cname, (cx, cy)) in enumerate(zip(corner_names, corners)):
+                cpath = f"{child_path}/{cname}"
+                cp_pt = UsdGeom.Xform.Define(stage, cpath).GetPrim()
+                self._set_attr(cp_pt, f"{NS}:type", "point", Sdf.ValueTypeNames.String)
+                self._set_attr(cp_pt, f"{NS}:x", float(cx), Sdf.ValueTypeNames.Double)
+                self._set_attr(cp_pt, f"{NS}:y", float(cy), Sdf.ValueTypeNames.Double)
+                p.corner_usd_paths.append(cpath)
+
+        elif isinstance(p, SketchCircle):
+            child_path = f"{prims_path}/Circle_{i:03d}"
+            child_xf = UsdGeom.Xform.Define(stage, child_path)
+            cp = child_xf.GetPrim()
+            self._set_attr(cp, f"{NS}:type", "circle", Sdf.ValueTypeNames.String)
+            self._set_attr(cp, f"{NS}:centerX", float(p.center[0]), Sdf.ValueTypeNames.Double)
+            self._set_attr(cp, f"{NS}:centerY", float(p.center[1]), Sdf.ValueTypeNames.Double)
+            self._set_attr(cp, f"{NS}:radius", float(p.radius), Sdf.ValueTypeNames.Double)
+            p.usd_path = child_path
+
+        elif isinstance(p, SketchArc):
+            child_path = f"{prims_path}/Arc_{i:03d}"
+            child_xf = UsdGeom.Xform.Define(stage, child_path)
+            cp = child_xf.GetPrim()
+            self._set_attr(cp, f"{NS}:type", "arc", Sdf.ValueTypeNames.String)
+            self._set_attr(cp, f"{NS}:startX", float(p.start[0]), Sdf.ValueTypeNames.Double)
+            self._set_attr(cp, f"{NS}:startY", float(p.start[1]), Sdf.ValueTypeNames.Double)
+            self._set_attr(cp, f"{NS}:midX", float(p.mid[0]), Sdf.ValueTypeNames.Double)
+            self._set_attr(cp, f"{NS}:midY", float(p.mid[1]), Sdf.ValueTypeNames.Double)
+            self._set_attr(cp, f"{NS}:endX", float(p.end[0]), Sdf.ValueTypeNames.Double)
+            self._set_attr(cp, f"{NS}:endY", float(p.end[1]), Sdf.ValueTypeNames.Double)
+            p.usd_path = child_path
+        else:
+            return ""
+
+        return child_path
+
+    def update_point_position(self, point_prim_path: str, x: float, y: float):
+        """
+        Update a point prim's sparkworks:x/y attributes.
+
+        Also updates the parent line's startX/Y or endX/Y, or the parent
+        rectangle's center/width/height to stay in sync.
+        """
+        if not USD_AVAILABLE:
+            return
+        stage = self._get_stage()
+        if stage is None:
+            return
+        prim = stage.GetPrimAtPath(point_prim_path)
+        if not prim.IsValid():
+            return
+        self._set_attr(prim, f"{NS}:x", float(x), Sdf.ValueTypeNames.Double)
+        self._set_attr(prim, f"{NS}:y", float(y), Sdf.ValueTypeNames.Double)
+        # Sync to parent line attributes
+        parent = prim.GetParent()
+        if not parent.IsValid():
+            return
+        parent_type = self._get_attr(parent, f"{NS}:type")
+        if parent_type == "line":
+            pt_name = prim.GetName()
+            if pt_name == "StartPt":
+                self._set_attr(parent, f"{NS}:startX", float(x), Sdf.ValueTypeNames.Double)
+                self._set_attr(parent, f"{NS}:startY", float(y), Sdf.ValueTypeNames.Double)
+            elif pt_name == "EndPt":
+                self._set_attr(parent, f"{NS}:endX", float(x), Sdf.ValueTypeNames.Double)
+                self._set_attr(parent, f"{NS}:endY", float(y), Sdf.ValueTypeNames.Double)
+        elif parent_type == "rectangle":
+            self._sync_rect_from_corners(stage, parent)
+
+    def _sync_rect_from_corners(self, stage, rect_prim):
+        """Recompute rectangle center/width/height from its corner sub-prims."""
+        corner_names = ["CornerBL", "CornerBR", "CornerTR", "CornerTL"]
+        xs, ys = [], []
+        for cname in corner_names:
+            cpath = f"{rect_prim.GetPath()}/{cname}"
+            cp = stage.GetPrimAtPath(cpath)
+            if cp.IsValid():
+                cx = self._get_attr(cp, f"{NS}:x")
+                cy = self._get_attr(cp, f"{NS}:y")
+                if cx is not None and cy is not None:
+                    xs.append(float(cx))
+                    ys.append(float(cy))
+        if len(xs) == 4:
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            self._set_attr(rect_prim, f"{NS}:centerX", (min_x + max_x) / 2.0, Sdf.ValueTypeNames.Double)
+            self._set_attr(rect_prim, f"{NS}:centerY", (min_y + max_y) / 2.0, Sdf.ValueTypeNames.Double)
+            self._set_attr(rect_prim, f"{NS}:width", max_x - min_x, Sdf.ValueTypeNames.Double)
+            self._set_attr(rect_prim, f"{NS}:height", max_y - min_y, Sdf.ValueTypeNames.Double)
 
     def _write_operation_attrs(self, prim, operation):
         """Write operation-specific custom attributes."""
@@ -1450,35 +1565,68 @@ class UsdBridge:
                 continue
 
             if prim_type == "line":
-                sketch.primitives.append(SketchLine(
-                    start=(
+                # Prefer reading from StartPt/EndPt children if present
+                child_path = child.GetPath()
+                start_pt = stage.GetPrimAtPath(f"{child_path}/StartPt")
+                end_pt = stage.GetPrimAtPath(f"{child_path}/EndPt")
+                if start_pt.IsValid() and end_pt.IsValid():
+                    sx = self._get_attr(start_pt, f"{NS}:x")
+                    sy = self._get_attr(start_pt, f"{NS}:y")
+                    ex = self._get_attr(end_pt, f"{NS}:x")
+                    ey = self._get_attr(end_pt, f"{NS}:y")
+                    start = (sx if sx is not None else 0.0, sy if sy is not None else 0.0)
+                    end = (ex if ex is not None else 0.0, ey if ey is not None else 0.0)
+                else:
+                    start = (
                         self._get_attr(child, f"{NS}:startX") or 0.0,
                         self._get_attr(child, f"{NS}:startY") or 0.0,
-                    ),
-                    end=(
+                    )
+                    end = (
                         self._get_attr(child, f"{NS}:endX") or 0.0,
                         self._get_attr(child, f"{NS}:endY") or 0.0,
-                    ),
-                ))
+                    )
+                line = SketchLine(start=start, end=end)
+                line.usd_path = str(child_path)
+                if start_pt.IsValid():
+                    line.start_usd_path = str(child_path) + "/StartPt"
+                if end_pt.IsValid():
+                    line.end_usd_path = str(child_path) + "/EndPt"
+                sketch.primitives.append(line)
             elif prim_type == "rectangle":
-                sketch.primitives.append(SketchRect(
+                child_path = child.GetPath()
+                rect = SketchRect(
                     center=(
                         self._get_attr(child, f"{NS}:centerX") or 0.0,
                         self._get_attr(child, f"{NS}:centerY") or 0.0,
                     ),
                     width=self._get_attr(child, f"{NS}:width") or 1.0,
                     height=self._get_attr(child, f"{NS}:height") or 1.0,
-                ))
+                )
+                rect.usd_path = str(child_path)
+                # Restore corner USD paths
+                corner_names = ["CornerBL", "CornerBR", "CornerTR", "CornerTL"]
+                corner_paths = []
+                for cname in corner_names:
+                    cpath = f"{child_path}/{cname}"
+                    cp = stage.GetPrimAtPath(cpath)
+                    if cp.IsValid():
+                        corner_paths.append(str(cpath))
+                    else:
+                        corner_paths.append(None)
+                rect.corner_usd_paths = corner_paths
+                sketch.primitives.append(rect)
             elif prim_type == "circle":
-                sketch.primitives.append(SketchCircle(
+                circ = SketchCircle(
                     center=(
                         self._get_attr(child, f"{NS}:centerX") or 0.0,
                         self._get_attr(child, f"{NS}:centerY") or 0.0,
                     ),
                     radius=self._get_attr(child, f"{NS}:radius") or 1.0,
-                ))
+                )
+                circ.usd_path = str(child.GetPath())
+                sketch.primitives.append(circ)
             elif prim_type == "arc":
-                sketch.primitives.append(SketchArc(
+                arc = SketchArc(
                     start=(
                         self._get_attr(child, f"{NS}:startX") or 0.0,
                         self._get_attr(child, f"{NS}:startY") or 0.0,
@@ -1491,7 +1639,9 @@ class UsdBridge:
                         self._get_attr(child, f"{NS}:endX") or 0.0,
                         self._get_attr(child, f"{NS}:endY") or 0.0,
                     ),
-                ))
+                )
+                arc.usd_path = str(child.GetPath())
+                sketch.primitives.append(arc)
 
         return sketch
 

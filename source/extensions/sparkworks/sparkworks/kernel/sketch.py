@@ -4,6 +4,13 @@
 A Sketch collects 2D geometry primitives (lines, arcs, circles, rectangles)
 on a given workplane and produces a closed Wire or Face that can be used by
 3D operations like Extrude and Revolve.
+
+Constraint integration
+----------------------
+Each Sketch now carries an optional :class:`ConstraintSolver` that manages
+the geometric relationships between primitives.  When constraints are added
+the solver can be invoked to update primitive coordinates so all constraints
+are satisfied.
 """
 
 from __future__ import annotations
@@ -11,7 +18,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # build123d imports — these wrap Open Cascade
 from build123d import (
@@ -27,6 +34,8 @@ from build123d import (
     Wire,
     make_face,
 )
+
+from .constraint_solver import ConstraintSolver, ConstraintType, EntityKind
 
 
 class SketchPrimitiveType(Enum):
@@ -48,6 +57,10 @@ class SketchLine:
     start: Tuple[float, float]
     end: Tuple[float, float]
     kind: SketchPrimitiveType = field(default=SketchPrimitiveType.LINE, init=False)
+    # USD prim paths (set when the primitive is written to USD)
+    usd_path: Optional[str] = field(default=None, repr=False)
+    start_usd_path: Optional[str] = field(default=None, repr=False)
+    end_usd_path: Optional[str] = field(default=None, repr=False)
 
     def to_dict(self) -> dict:
         return {"type": "line", "start": list(self.start), "end": list(self.end)}
@@ -64,6 +77,21 @@ class SketchRect:
     width: float = 1.0
     height: float = 1.0
     kind: SketchPrimitiveType = field(default=SketchPrimitiveType.RECTANGLE, init=False)
+    usd_path: Optional[str] = field(default=None, repr=False)
+    # Corner sub-prim USD paths (BL, BR, TR, TL)
+    corner_usd_paths: List[Optional[str]] = field(default_factory=lambda: [None, None, None, None], repr=False)
+
+    @property
+    def corners(self) -> List[Tuple[float, float]]:
+        """Return corners as [BL, BR, TR, TL]."""
+        cx, cy = self.center
+        hw, hh = self.width / 2.0, self.height / 2.0
+        return [
+            (cx - hw, cy - hh),   # BL
+            (cx + hw, cy - hh),   # BR
+            (cx + hw, cy + hh),   # TR
+            (cx - hw, cy + hh),   # TL
+        ]
 
     def to_dict(self) -> dict:
         return {
@@ -84,6 +112,7 @@ class SketchCircle:
     center: Tuple[float, float] = (0.0, 0.0)
     radius: float = 1.0
     kind: SketchPrimitiveType = field(default=SketchPrimitiveType.CIRCLE, init=False)
+    usd_path: Optional[str] = field(default=None, repr=False)
 
     def to_dict(self) -> dict:
         return {
@@ -104,6 +133,7 @@ class SketchArc:
     mid: Tuple[float, float]
     end: Tuple[float, float]
     kind: SketchPrimitiveType = field(default=SketchPrimitiveType.ARC, init=False)
+    usd_path: Optional[str] = field(default=None, repr=False)
 
     def to_dict(self) -> dict:
         return {
@@ -116,6 +146,37 @@ class SketchArc:
     @classmethod
     def from_dict(cls, d: dict) -> "SketchArc":
         return cls(start=tuple(d["start"]), mid=tuple(d["mid"]), end=tuple(d["end"]))
+
+
+def _arc_from_3pts(
+    sx: float, sy: float,
+    mx: float, my: float,
+    ex: float, ey: float,
+) -> Tuple[float, float, float, float, float]:
+    """
+    Compute (center_x, center_y, radius, start_angle, end_angle) from three
+    points on a circular arc.
+    """
+    ax, ay = sx, sy
+    bx, by = mx, my
+    cx, cy = ex, ey
+    D = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+    if abs(D) < 1e-12:
+        # Degenerate — colinear points
+        mid_x = (sx + ex) / 2.0
+        mid_y = (sy + ey) / 2.0
+        r = math.hypot(ex - sx, ey - sy) / 2.0
+        return mid_x, mid_y, max(r, 1e-6), 0.0, math.pi
+    ux = ((ax * ax + ay * ay) * (by - cy) +
+          (bx * bx + by * by) * (cy - ay) +
+          (cx * cx + cy * cy) * (ay - by)) / D
+    uy = ((ax * ax + ay * ay) * (cx - bx) +
+          (bx * bx + by * by) * (ax - cx) +
+          (cx * cx + cy * cy) * (bx - ax)) / D
+    r = math.hypot(ax - ux, ay - uy)
+    sa = math.atan2(sy - uy, sx - ux)
+    ea = math.atan2(ey - uy, ex - ux)
+    return ux, uy, r, sa, ea
 
 
 # Mapping for deserialization
@@ -172,6 +233,11 @@ class Sketch:
     # Metadata for recreating the face_profile on reload: body name + face index
     face_profile_body: Optional[str] = field(default=None, repr=False)
     face_profile_index: Optional[int] = field(default=None, repr=False)
+    # Constraint solver — manages geometric relationships between primitives
+    solver: Optional[ConstraintSolver] = field(default=None, repr=False)
+    # Maps primitive index → dict of entity ids created in the solver
+    # e.g. {0: {"line": 2, "p1": 0, "p2": 1}}
+    _prim_entities: Dict[int, dict] = field(default_factory=dict, repr=False)
 
     @property
     def plane(self) -> Plane:
@@ -186,7 +252,10 @@ class Sketch:
 
     def add_line(self, start: Tuple[float, float], end: Tuple[float, float]) -> SketchLine:
         prim = SketchLine(start=start, end=end)
+        idx = len(self.primitives)
         self.primitives.append(prim)
+        if self.solver is not None:
+            self._register_primitive(idx, prim)
         return prim
 
     def add_rectangle(
@@ -196,14 +265,20 @@ class Sketch:
         center: Tuple[float, float] = (0.0, 0.0),
     ) -> SketchRect:
         prim = SketchRect(center=center, width=width, height=height)
+        idx = len(self.primitives)
         self.primitives.append(prim)
+        if self.solver is not None:
+            self._register_primitive(idx, prim)
         return prim
 
     def add_circle(
         self, radius: float, center: Tuple[float, float] = (0.0, 0.0)
     ) -> SketchCircle:
         prim = SketchCircle(center=center, radius=radius)
+        idx = len(self.primitives)
         self.primitives.append(prim)
+        if self.solver is not None:
+            self._register_primitive(idx, prim)
         return prim
 
     def add_arc(
@@ -213,8 +288,230 @@ class Sketch:
         end: Tuple[float, float],
     ) -> SketchArc:
         prim = SketchArc(start=start, mid=mid, end=end)
+        idx = len(self.primitives)
         self.primitives.append(prim)
+        if self.solver is not None:
+            self._register_primitive(idx, prim)
         return prim
+
+    # -- Constraint solver integration ----------------------------------------
+
+    def ensure_solver(self) -> ConstraintSolver:
+        """Return the solver, creating one if it doesn't exist yet."""
+        if self.solver is None:
+            self.solver = ConstraintSolver()
+            self._prim_entities = {}
+            self._register_all_primitives()
+        return self.solver
+
+    def _register_all_primitives(self):
+        """Register all existing primitives with the solver (for late init)."""
+        if self.solver is None:
+            return
+        for i, prim in enumerate(self.primitives):
+            if i not in self._prim_entities:
+                self._register_primitive(i, prim)
+
+    def _register_primitive(self, idx: int, prim):
+        """Register a single primitive with the constraint solver."""
+        if self.solver is None:
+            return
+        s = self.solver
+
+        if isinstance(prim, SketchLine):
+            lid, p1, p2 = s.add_line_from_coords(
+                prim.start[0], prim.start[1],
+                prim.end[0], prim.end[1],
+                prim_index=idx,
+            )
+            self._prim_entities[idx] = {"line": lid, "p1": p1, "p2": p2}
+
+        elif isinstance(prim, SketchRect):
+            cx, cy = prim.center
+            hw, hh = prim.width / 2.0, prim.height / 2.0
+            corners = [
+                (cx - hw, cy - hh),
+                (cx + hw, cy - hh),
+                (cx + hw, cy + hh),
+                (cx - hw, cy + hh),
+            ]
+            pts = []
+            for x, y in corners:
+                pts.append(s.add_point(x, y, prim_index=idx))
+            lines = []
+            for j in range(4):
+                lid = s.add_line(pts[j], pts[(j + 1) % 4], prim_index=idx)
+                lines.append(lid)
+            self._prim_entities[idx] = {
+                "p0": pts[0], "p1": pts[1], "p2": pts[2], "p3": pts[3],
+                "l0": lines[0], "l1": lines[1], "l2": lines[2], "l3": lines[3],
+            }
+            # Auto-add rectangle structure constraints:
+            # horizontal bottom/top, vertical left/right
+            s.add_constraint(ConstraintType.HORIZONTAL_LINE, [lines[0]])
+            s.add_constraint(ConstraintType.HORIZONTAL_LINE, [lines[2]])
+            s.add_constraint(ConstraintType.VERTICAL_LINE, [lines[1]])
+            s.add_constraint(ConstraintType.VERTICAL_LINE, [lines[3]])
+            # Coincident corners
+            s.constrain_coincident(pts[1], pts[1])  # these are already shared via line refs
+            # The sharing is implicit through the line entity param indices
+
+        elif isinstance(prim, SketchCircle):
+            cid, center_eid = s.add_circle(
+                prim.center[0], prim.center[1], prim.radius,
+                prim_index=idx,
+            )
+            self._prim_entities[idx] = {"circle": cid, "center": center_eid}
+
+        elif isinstance(prim, SketchArc):
+            mx, my = prim.mid
+            sx, sy = prim.start
+            ex, ey = prim.end
+            # Compute arc center, radius, angles from three points
+            cx, cy, r, sa, ea = _arc_from_3pts(sx, sy, mx, my, ex, ey)
+            aid, center_eid = s.add_arc(cx, cy, r, sa, ea, prim_index=idx)
+            self._prim_entities[idx] = {"arc": aid, "center": center_eid}
+
+    def _sync_primitives_from_solver(self):
+        """Push solver parameter values back into the primitive dataclasses."""
+        if self.solver is None:
+            return
+        s = self.solver
+
+        for idx, ents in self._prim_entities.items():
+            if idx >= len(self.primitives):
+                continue
+            prim = self.primitives[idx]
+
+            if isinstance(prim, SketchLine) and "p1" in ents and "p2" in ents:
+                prim.start = s.get_point(ents["p1"])
+                prim.end = s.get_point(ents["p2"])
+
+            elif isinstance(prim, SketchRect) and "p0" in ents:
+                p0 = s.get_point(ents["p0"])
+                p2 = s.get_point(ents["p2"])
+                cx = (p0[0] + p2[0]) / 2.0
+                cy = (p0[1] + p2[1]) / 2.0
+                prim.center = (cx, cy)
+                prim.width = abs(p2[0] - p0[0])
+                prim.height = abs(p2[1] - p0[1])
+
+            elif isinstance(prim, SketchCircle) and "circle" in ents:
+                cx, cy, r = s.get_circle(ents["circle"])
+                prim.center = (cx, cy)
+                prim.radius = r
+
+            elif isinstance(prim, SketchArc) and "arc" in ents:
+                cx, cy, r, sa, ea = s.get_arc(ents["arc"])
+                prim.start = (cx + r * math.cos(sa), cy + r * math.sin(sa))
+                prim.end = (cx + r * math.cos(ea), cy + r * math.sin(ea))
+                mid_a = (sa + ea) / 2.0
+                prim.mid = (cx + r * math.cos(mid_a), cy + r * math.sin(mid_a))
+
+    def solve_constraints(self) -> bool:
+        """
+        Solve all constraints and update primitive coordinates.
+
+        Returns ``True`` if all constraints are satisfied.
+        """
+        if self.solver is None:
+            return True
+        ok = self.solver.solve()
+        self._sync_primitives_from_solver()
+        return ok
+
+    def drag_point(self, entity_id: int, target_x: float, target_y: float) -> bool:
+        """
+        Drag a solver point entity to a new position and re-solve.
+
+        Used for interactive editing in the sketch viewport.
+        Returns ``True`` if the solve succeeded.
+        """
+        if self.solver is None:
+            return False
+        ok = self.solver.solve_drag(entity_id, target_x, target_y)
+        self._sync_primitives_from_solver()
+        return ok
+
+    def get_entity_ids_for_primitive(self, prim_index: int) -> dict:
+        """
+        Get the solver entity ids for a given primitive index.
+
+        Returns a dict like ``{"line": 2, "p1": 0, "p2": 1}`` or empty.
+        """
+        return self._prim_entities.get(prim_index, {})
+
+    def get_solver_eid_for_usd_path(self, usd_path: str) -> Optional[int]:
+        """
+        Map a point's USD path to the corresponding solver entity ID.
+
+        Returns ``None`` if no match is found.
+        """
+        for idx, prim in enumerate(self.primitives):
+            ents = self._prim_entities.get(idx, {})
+            if isinstance(prim, SketchLine):
+                if getattr(prim, "start_usd_path", None) == usd_path and "p1" in ents:
+                    return ents["p1"]
+                if getattr(prim, "end_usd_path", None) == usd_path and "p2" in ents:
+                    return ents["p2"]
+            elif isinstance(prim, SketchRect):
+                corner_paths = getattr(prim, "corner_usd_paths", None) or []
+                for ci, cp in enumerate(corner_paths):
+                    key = f"p{ci}"
+                    if cp == usd_path and key in ents:
+                        return ents[key]
+            elif isinstance(prim, SketchCircle):
+                if getattr(prim, "usd_path", None) == usd_path and "center" in ents:
+                    return ents["center"]
+        return None
+
+    def get_all_solver_points(self) -> List[Tuple[int, float, float]]:
+        """
+        Return (entity_id, x, y) for every point entity in the solver.
+
+        Useful for hit-testing in the viewport.
+        """
+        if self.solver is None:
+            return []
+        result = []
+        for eid, e in self.solver.entities.items():
+            if e.kind == EntityKind.POINT:
+                x, y = self.solver.get_point(eid)
+                result.append((eid, x, y))
+        return result
+
+    def add_constraint(
+        self,
+        ctype: ConstraintType,
+        entity_ids: List[int],
+        value: float = 0.0,
+        selectors: Optional[List[str]] = None,
+    ) -> int:
+        """
+        Add a constraint to this sketch's solver.
+
+        See :meth:`ConstraintSolver.add_constraint` for details.
+        Returns the constraint id.
+        """
+        s = self.ensure_solver()
+        return s.add_constraint(ctype, entity_ids, value, selectors)
+
+    def remove_constraint(self, cid: int):
+        """Remove a constraint by id."""
+        if self.solver is not None:
+            self.solver.remove_constraint(cid)
+
+    @property
+    def constraint_count(self) -> int:
+        if self.solver is None:
+            return 0
+        return len(self.solver.constraints)
+
+    @property
+    def degrees_of_freedom(self) -> int:
+        if self.solver is None:
+            return -1
+        return self.solver.dof
 
     # -- Closed-loop detection -----------------------------------------------
 
@@ -644,6 +941,12 @@ class Sketch:
             d["plane_type"] = getattr(cp, "plane_type", "XY")
             d["plane_origin"] = list(getattr(cp, "origin", (0, 0, 0)))
             d["plane_normal"] = list(getattr(cp, "normal", (0, 0, 1)))
+        # Persist constraint solver state
+        if self.solver is not None:
+            d["solver"] = self.solver.to_dict()
+            d["prim_entities"] = {
+                str(k): v for k, v in self._prim_entities.items()
+            }
         return d
 
     @classmethod
@@ -660,4 +963,11 @@ class Sketch:
                 origin=tuple(d["plane_origin"]),
                 normal=tuple(d["plane_normal"]),
             )
+
+        # Reconstruct constraint solver
+        if "solver" in d:
+            sketch.solver = ConstraintSolver.from_dict(d["solver"])
+            raw_pe = d.get("prim_entities", {})
+            sketch._prim_entities = {int(k): v for k, v in raw_pe.items()}
+
         return sketch
