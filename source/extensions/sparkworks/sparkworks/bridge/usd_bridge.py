@@ -1071,6 +1071,8 @@ class UsdBridge:
             prim = stage.GetPrimAtPath(child_path)
             # Reuse the existing _write_sketch_attrs to persist sketch data
             self._write_sketch_attrs(stage, child_path, prim, sketch)
+            # Write 3D curve visual (only under Sketches, not Timeline)
+            self.write_sketch_curves(child_path, sketch)
             print(f"[SparkWorks] Wrote sketch '{sketch_id}' at {child_path}")
 
         print(f"[SparkWorks] Sketches saved ({sketch_registry.count} sketches)")
@@ -1360,9 +1362,6 @@ class UsdBridge:
 
         for i, p in enumerate(sketch.primitives):
             self._write_single_prim_to_usd(stage, prims_path, i, p)
-
-        # Write 3D curve visual so the sketch appears in the 3D viewport
-        self.write_sketch_curves(prim_path, sketch)
 
     # -- Single-primitive immediate write ------------------------------------
 
