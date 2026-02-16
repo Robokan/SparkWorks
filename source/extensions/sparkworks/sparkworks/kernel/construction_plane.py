@@ -118,6 +118,49 @@ class ConstructionPlane:
             (cx - su * ux + sv * vx, cy - su * uy + sv * vy, cz - su * uz + sv * vz),
         ]
 
+    def tangent_vectors(self):
+        """Return (U, V) tangent vectors for the plane.
+
+        U and V are unit vectors lying in the plane, perpendicular to the
+        normal and to each other.  Together with ``world_origin`` they map
+        2D sketch coordinates to 3D::
+
+            world_pt = origin + x * U + y * V
+        """
+        nx, ny, nz = self.normal
+        if abs(nx) < 0.9:
+            ref = (1.0, 0.0, 0.0)
+        else:
+            ref = (0.0, 1.0, 0.0)
+        ux = ny * ref[2] - nz * ref[1]
+        uy = nz * ref[0] - nx * ref[2]
+        uz = nx * ref[1] - ny * ref[0]
+        mag = math.sqrt(ux * ux + uy * uy + uz * uz) or 1.0
+        ux, uy, uz = ux / mag, uy / mag, uz / mag
+        vx = ny * uz - nz * uy
+        vy = nz * ux - nx * uz
+        vz = nx * uy - ny * ux
+        if self.rotation != 0.0:
+            rad = math.radians(self.rotation)
+            cos_a, sin_a = math.cos(rad), math.sin(rad)
+            ux, uy, uz, vx, vy, vz = (
+                cos_a * ux + sin_a * vx,
+                cos_a * uy + sin_a * vy,
+                cos_a * uz + sin_a * vz,
+                -sin_a * ux + cos_a * vx,
+                -sin_a * uy + cos_a * vy,
+                -sin_a * uz + cos_a * vz,
+            )
+        return (ux, uy, uz), (vx, vy, vz)
+
+    def to_world(self, x: float, y: float) -> Tuple[float, float, float]:
+        """Map a 2D sketch point (x, y) to its 3D world position."""
+        (ux, uy, uz), (vx, vy, vz) = self.tangent_vectors()
+        ox, oy, oz = self.world_origin
+        return (ox + x * ux + y * vx,
+                oy + x * uy + y * vy,
+                oz + x * uz + y * vz)
+
     def to_build123d_plane(self) -> Plane:
         """
         Convert to a ``build123d.Plane`` suitable for sketch construction.

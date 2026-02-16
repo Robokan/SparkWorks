@@ -113,6 +113,13 @@ class SketchCircle:
     radius: float = 1.0
     kind: SketchPrimitiveType = field(default=SketchPrimitiveType.CIRCLE, init=False)
     usd_path: Optional[str] = field(default=None, repr=False)
+    # Sub-prim for the radius control point on the circumference (+X direction)
+    edge_usd_path: Optional[str] = field(default=None, repr=False)
+
+    @property
+    def edge_point(self) -> Tuple[float, float]:
+        """Position of the radius handle on the circumference (+X)."""
+        return (self.center[0] + self.radius, self.center[1])
 
     def to_dict(self) -> dict:
         return {
@@ -549,6 +556,40 @@ class Sketch:
         """
         s = self.ensure_solver()
         return s.add_constraint(ctype, entity_ids, value, selectors)
+
+    def remove_primitive(self, index: int):
+        """
+        Remove a primitive by index.
+
+        Also removes the associated solver entities and any constraints
+        that reference them.  ``_prim_entities`` is re-indexed so that
+        remaining primitives keep their correct mapping.
+
+        Returns the list of removed Constraint objects (useful for
+        cleaning up USD prims).
+        """
+        if index < 0 or index >= len(self.primitives):
+            return []
+
+        removed_constraints = []
+
+        if self.solver is not None and index in self._prim_entities:
+            ents = self._prim_entities.pop(index)
+            eids = set(ents.values())
+            removed_constraints = self.solver.remove_entities_and_dependents(eids)
+
+        self.primitives.pop(index)
+
+        # Re-index _prim_entities: shift all keys > index down by 1
+        new_pe = {}
+        for k, v in self._prim_entities.items():
+            if k > index:
+                new_pe[k - 1] = v
+            else:
+                new_pe[k] = v
+        self._prim_entities = new_pe
+
+        return removed_constraints
 
     def remove_constraint(self, cid: int):
         """Remove a constraint by id."""

@@ -719,6 +719,10 @@ class UsdBridge:
         sk_path = f"{self.sketches_root}/{safe_name}"
         prim = stage.GetPrimAtPath(sk_path)
         if prim.IsValid():
+            # Ensure the prim is typed so Imageable API works
+            if not prim.GetTypeName():
+                UsdGeom.Xform.Define(stage, sk_path)
+                prim = stage.GetPrimAtPath(sk_path)
             img = UsdGeom.Imageable(prim)
             if visible:
                 img.MakeVisible()
@@ -744,6 +748,10 @@ class UsdBridge:
         safe_except = except_sketch.replace(" ", "_")
         for child in sk_prim.GetChildren():
             child_name = child.GetName()
+            # Ensure the child is typed so Imageable API works
+            if not child.GetTypeName():
+                UsdGeom.Xform.Define(stage, str(child.GetPath()))
+                child = stage.GetPrimAtPath(str(child.GetPath()))
             img = UsdGeom.Imageable(child)
             if child_name == safe_except:
                 img.MakeVisible()
@@ -1057,9 +1065,9 @@ class UsdBridge:
         for sketch_id, sketch in sketch_registry.sketches.items():
             safe_id = sketch_id.replace(" ", "_")
             child_path = f"{sk_path}/{safe_id}"
-            child_prim = stage.GetPrimAtPath(child_path)
-            if not child_prim.IsValid():
-                UsdGeom.Xform.Define(stage, child_path)
+            # Always define as Xform so the prim has a proper type
+            # (it may already exist as an untyped auto-created ancestor).
+            UsdGeom.Xform.Define(stage, child_path)
             prim = stage.GetPrimAtPath(child_path)
             # Reuse the existing _write_sketch_attrs to persist sketch data
             self._write_sketch_attrs(stage, child_path, prim, sketch)
@@ -1236,6 +1244,97 @@ class UsdBridge:
         elif feature.feature_type == FeatureType.OPERATION and feature.operation:
             self._write_operation_attrs(prim, feature.operation)
 
+    def _ensure_sketch_xform(self, stage, sketch_path: str):
+        """Ensure *sketch_path* is a typed ``Xform`` prim.
+
+        When child prims are created first (e.g. ``Primitives/Line_000``),
+        USD auto-creates ancestor prims as *untyped overs*.  This helper
+        re-defines the sketch prim as a proper Xform so it has a type
+        in the stage panel and supports visibility toggling.
+        """
+        prim = stage.GetPrimAtPath(sketch_path)
+        if not prim.IsValid() or not prim.GetTypeName():
+            UsdGeom.Xform.Define(stage, sketch_path)
+
+    # -- 3D curve visual for sketch lines ------------------------------------
+
+    def write_sketch_curves(self, sketch_path: str, sketch):
+        """Create a ``BasisCurves`` prim showing sketch lines in 3D.
+
+        The curves are projected onto the sketch's construction plane so
+        the sketch geometry is visible in the 3D viewport and responds
+        to the prim's visibility toggle.
+        """
+        if not USD_AVAILABLE:
+            return
+        stage = self._get_stage()
+        if stage is None:
+            return
+
+        from ..kernel.sketch import SketchLine, SketchRect, SketchCircle, SketchArc
+
+        cp = sketch.construction_plane
+        if cp is None:
+            return
+
+        curves_path = f"{sketch_path}/CurvesVisual"
+
+        # Collect 3D points and per-curve vertex counts
+        all_points = []
+        curve_counts = []
+        import math as _m
+
+        for prim in sketch.primitives:
+            if isinstance(prim, SketchLine):
+                p0 = cp.to_world(prim.start[0], prim.start[1])
+                p1 = cp.to_world(prim.end[0], prim.end[1])
+                all_points.extend([Gf.Vec3f(*p0), Gf.Vec3f(*p1)])
+                curve_counts.append(2)
+            elif isinstance(prim, SketchRect):
+                corners = prim.corners  # BL, BR, TR, TL
+                pts = [Gf.Vec3f(*cp.to_world(c[0], c[1])) for c in corners]
+                pts.append(pts[0])  # close the loop
+                all_points.extend(pts)
+                curve_counts.append(5)
+            elif isinstance(prim, SketchCircle):
+                cx, cy = prim.center
+                r = prim.radius
+                segs = 32
+                pts = []
+                for i in range(segs + 1):
+                    a = 2.0 * _m.pi * i / segs
+                    sx = cx + r * _m.cos(a)
+                    sy = cy + r * _m.sin(a)
+                    pts.append(Gf.Vec3f(*cp.to_world(sx, sy)))
+                all_points.extend(pts)
+                curve_counts.append(segs + 1)
+            elif isinstance(prim, SketchArc):
+                pts_2d = [prim.start, prim.mid, prim.end]
+                pts = [Gf.Vec3f(*cp.to_world(p[0], p[1])) for p in pts_2d]
+                all_points.extend(pts)
+                curve_counts.append(3)
+
+        if not all_points:
+            # Remove stale visual if no primitives
+            old = stage.GetPrimAtPath(curves_path)
+            if old.IsValid():
+                stage.RemovePrim(curves_path)
+            return
+
+        curves = UsdGeom.BasisCurves.Define(stage, curves_path)
+        curves.GetPointsAttr().Set(Vt.Vec3fArray(all_points))
+        curves.GetCurveVertexCountsAttr().Set(Vt.IntArray(curve_counts))
+        curves.GetTypeAttr().Set(UsdGeom.Tokens.linear)
+        curves.GetWidthsAttr().Set(Vt.FloatArray([1.0] * len(all_points)))
+        curves.GetWidthsInterpolation()  # default vertex
+
+        # Sketch-like display colour (light blue)
+        primvars = UsdGeom.PrimvarsAPI(curves.GetPrim())
+        color_pv = primvars.CreatePrimvar(
+            "displayColor", Sdf.ValueTypeNames.Color3fArray
+        )
+        color_pv.Set(Vt.Vec3fArray([Gf.Vec3f(0.2, 0.6, 1.0)]))
+
     def _write_sketch_attrs(self, stage, prim_path: str, prim, sketch):
         """Write sketch-specific attributes and primitive children."""
         self._set_attr(prim, f"{NS}:planeName", sketch.plane_name, Sdf.ValueTypeNames.String)
@@ -1262,6 +1361,9 @@ class UsdBridge:
         for i, p in enumerate(sketch.primitives):
             self._write_single_prim_to_usd(stage, prims_path, i, p)
 
+        # Write 3D curve visual so the sketch appears in the 3D viewport
+        self.write_sketch_curves(prim_path, sketch)
+
     # -- Single-primitive immediate write ------------------------------------
 
     def write_sketch_primitive(self, sketch_path: str, prim_index: int, primitive) -> str:
@@ -1280,6 +1382,10 @@ class UsdBridge:
             return ""
 
         from ..kernel.sketch import SketchLine, SketchRect, SketchCircle, SketchArc
+
+        # Ensure the sketch prim itself is typed as Xform (not an
+        # auto-created untyped ancestor).
+        self._ensure_sketch_xform(stage, sketch_path)
 
         prims_path = f"{sketch_path}/Primitives"
         UsdGeom.Xform.Define(stage, prims_path)
@@ -1346,6 +1452,14 @@ class UsdBridge:
             self._set_attr(cp, f"{NS}:centerY", float(p.center[1]), Sdf.ValueTypeNames.Double)
             self._set_attr(cp, f"{NS}:radius", float(p.radius), Sdf.ValueTypeNames.Double)
             p.usd_path = child_path
+            # Create edge (radius handle) sub-prim on the circumference (+X)
+            edge_path = f"{child_path}/EdgePt"
+            ep = UsdGeom.Xform.Define(stage, edge_path).GetPrim()
+            ex, ey = p.edge_point
+            self._set_attr(ep, f"{NS}:type", "point", Sdf.ValueTypeNames.String)
+            self._set_attr(ep, f"{NS}:x", float(ex), Sdf.ValueTypeNames.Double)
+            self._set_attr(ep, f"{NS}:y", float(ey), Sdf.ValueTypeNames.Double)
+            p.edge_usd_path = edge_path
 
         elif isinstance(p, SketchArc):
             child_path = f"{prims_path}/Arc_{i:03d}"
@@ -1363,6 +1477,114 @@ class UsdBridge:
             return ""
 
         return child_path
+
+    # -- Constraint prim CRUD --------------------------------------------------
+
+    def write_constraint_prim(self, sketch_path: str, constraint) -> str:
+        """
+        Write a single constraint as a USD XForm prim under
+        ``sketch_path/Constraints/C_xxx``.  Sets sparkworks: attributes
+        for type, entity IDs, value, and selectors.  Updates
+        ``constraint.usd_path`` and returns the prim path.
+        """
+        if not USD_AVAILABLE:
+            return ""
+        stage = self._get_stage()
+        if stage is None:
+            return ""
+
+        self._ensure_sketch_xform(stage, sketch_path)
+
+        constr_root = f"{sketch_path}/Constraints"
+        UsdGeom.Xform.Define(stage, constr_root)
+
+        cpath = f"{constr_root}/C_{constraint.cid:03d}"
+        xf = UsdGeom.Xform.Define(stage, cpath)
+        cp = xf.GetPrim()
+        self._set_attr(cp, f"{NS}:type", "constraint", Sdf.ValueTypeNames.String)
+        self._set_attr(cp, f"{NS}:constraintType", constraint.ctype.name, Sdf.ValueTypeNames.String)
+        self._set_attr(cp, f"{NS}:cid", constraint.cid, Sdf.ValueTypeNames.Int)
+        self._set_attr(cp, f"{NS}:value", float(constraint.value), Sdf.ValueTypeNames.Double)
+        self._set_attr(cp, f"{NS}:entityIds",
+                       Vt.IntArray(constraint.entity_ids), Sdf.ValueTypeNames.IntArray)
+        self._set_attr(cp, f"{NS}:selectors",
+                       Vt.StringArray(constraint.selectors), Sdf.ValueTypeNames.StringArray)
+        self._set_attr(cp, f"{NS}:driving", constraint.driving, Sdf.ValueTypeNames.Bool)
+
+        constraint.usd_path = cpath
+        return cpath
+
+    def remove_constraint_prim(self, prim_path: str):
+        """Remove a constraint prim from the stage."""
+        if not USD_AVAILABLE:
+            return
+        stage = self._get_stage()
+        if stage and prim_path:
+            stage.RemovePrim(prim_path)
+
+    def load_constraint_prims(self, sketch_path: str):
+        """
+        Read constraint prims from ``sketch_path/Constraints/`` and return
+        a list of dicts suitable for reconstructing constraints in the solver.
+
+        Each dict has: cid, ctype (str), entity_ids, value, selectors, driving.
+        """
+        if not USD_AVAILABLE:
+            return []
+        stage = self._get_stage()
+        if stage is None:
+            return []
+
+        constr_root = f"{sketch_path}/Constraints"
+        root_prim = stage.GetPrimAtPath(constr_root)
+        if not root_prim or not root_prim.IsValid():
+            return []
+
+        result = []
+        for child in root_prim.GetChildren():
+            tp = child.GetAttribute(f"{NS}:type")
+            if not tp.IsValid() or tp.Get() != "constraint":
+                continue
+            ctype_attr = child.GetAttribute(f"{NS}:constraintType")
+            cid_attr = child.GetAttribute(f"{NS}:cid")
+            val_attr = child.GetAttribute(f"{NS}:value")
+            eids_attr = child.GetAttribute(f"{NS}:entityIds")
+            sels_attr = child.GetAttribute(f"{NS}:selectors")
+            drv_attr = child.GetAttribute(f"{NS}:driving")
+            if not ctype_attr.IsValid():
+                continue
+            d = {
+                "cid": int(cid_attr.Get()) if cid_attr.IsValid() else 0,
+                "ctype": str(ctype_attr.Get()),
+                "entity_ids": list(eids_attr.Get()) if eids_attr.IsValid() else [],
+                "value": float(val_attr.Get()) if val_attr.IsValid() else 0.0,
+                "selectors": list(sels_attr.Get()) if sels_attr.IsValid() else [],
+                "driving": bool(drv_attr.Get()) if drv_attr.IsValid() else True,
+                "usd_path": str(child.GetPath()),
+            }
+            result.append(d)
+        return result
+
+    def write_all_constraint_prims(self, sketch_path: str, solver):
+        """
+        Write all constraints from *solver* to USD under
+        ``sketch_path/Constraints/``.  Clears any existing constraint prims
+        first to stay in sync.
+        """
+        if not USD_AVAILABLE or solver is None:
+            return
+        stage = self._get_stage()
+        if stage is None:
+            return
+
+        constr_root = f"{sketch_path}/Constraints"
+        root_prim = stage.GetPrimAtPath(constr_root)
+        if root_prim and root_prim.IsValid():
+            stage.RemovePrim(constr_root)
+        UsdGeom.Xform.Define(stage, constr_root)
+
+        for c in solver.constraints:
+            self.write_constraint_prim(sketch_path, c)
 
     def update_point_position(self, point_prim_path: str, x: float, y: float):
         """
@@ -1396,6 +1618,32 @@ class UsdBridge:
                 self._set_attr(parent, f"{NS}:endY", float(y), Sdf.ValueTypeNames.Double)
         elif parent_type == "rectangle":
             self._sync_rect_from_corners(stage, parent)
+        elif parent_type == "circle":
+            pt_name = prim.GetName()
+            if pt_name == "EdgePt":
+                # Compute new radius from edge point position and center
+                cx_val = self._get_attr(parent, f"{NS}:centerX")
+                cy_val = self._get_attr(parent, f"{NS}:centerY")
+                if cx_val is not None and cy_val is not None:
+                    import math as _m
+                    new_r = max(0.1, _m.hypot(x - float(cx_val), y - float(cy_val)))
+                    self._set_attr(parent, f"{NS}:radius", new_r, Sdf.ValueTypeNames.Double)
+        # If the prim itself is a circle (center is the circle prim), update centerX/Y
+        prim_type = self._get_attr(prim, f"{NS}:type")
+        if prim_type == "circle":
+            self._set_attr(prim, f"{NS}:centerX", float(x), Sdf.ValueTypeNames.Double)
+            self._set_attr(prim, f"{NS}:centerY", float(y), Sdf.ValueTypeNames.Double)
+
+    def update_circle_radius(self, circle_prim_path: str, radius: float):
+        """Update a circle prim's sparkworks:radius attribute."""
+        if not USD_AVAILABLE:
+            return
+        stage = self._get_stage()
+        if stage is None:
+            return
+        prim = stage.GetPrimAtPath(circle_prim_path)
+        if prim.IsValid():
+            self._set_attr(prim, f"{NS}:radius", float(radius), Sdf.ValueTypeNames.Double)
 
     def _sync_rect_from_corners(self, stage, rect_prim):
         """Recompute rectangle center/width/height from its corner sub-prims."""
@@ -1624,6 +1872,11 @@ class UsdBridge:
                     radius=self._get_attr(child, f"{NS}:radius") or 1.0,
                 )
                 circ.usd_path = str(child.GetPath())
+                # Load edge (radius handle) sub-prim if present
+                edge_path = f"{child.GetPath()}/EdgePt"
+                edge_prim = stage.GetPrimAtPath(edge_path)
+                if edge_prim and edge_prim.IsValid():
+                    circ.edge_usd_path = edge_path
                 sketch.primitives.append(circ)
             elif prim_type == "arc":
                 arc = SketchArc(
@@ -1642,6 +1895,30 @@ class UsdBridge:
                 )
                 arc.usd_path = str(child.GetPath())
                 sketch.primitives.append(arc)
+
+        # Load constraints from USD and restore them into the solver
+        sketch_path = str(prim.GetPath())
+        constraint_dicts = self.load_constraint_prims(sketch_path)
+        if constraint_dicts:
+            from ..kernel.constraint_solver import ConstraintType
+            solver = sketch.ensure_solver()
+            for cd in constraint_dicts:
+                try:
+                    ctype = ConstraintType[cd["ctype"]]
+                except KeyError:
+                    continue
+                cid = solver.add_constraint(
+                    ctype,
+                    entity_ids=cd["entity_ids"],
+                    value=cd["value"],
+                    selectors=cd["selectors"],
+                    driving=cd["driving"],
+                )
+                # Restore the USD path on the constraint object
+                for c in solver.constraints:
+                    if c.cid == cid:
+                        c.usd_path = cd.get("usd_path")
+                        break
 
         return sketch
 

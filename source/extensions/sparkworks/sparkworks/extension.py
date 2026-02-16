@@ -8,6 +8,7 @@ into a cohesive CAD modeling experience inside Isaac Sim.
 from __future__ import annotations
 
 import asyncio
+import math
 from typing import Dict, List, Optional
 
 import omni.ext
@@ -290,7 +291,10 @@ class ParametricCadExtension(omni.ext.IExt):
         sv.on_viewport_key = self._on_viewport_key
         sv.on_select_prim = self._on_viewport_select_prim
         sv.on_drag_point_path = self._on_drag_point_path
+        sv.on_drag_line_path = self._on_drag_line_path
         sv.on_snap_join = self._on_snap_join_paths
+        sv.on_context_menu = self._on_context_menu
+        sv.on_background_click = self._on_viewport_background_click
 
     def _set_status(self, msg: str):
         self._toolbar.set_status(msg)
@@ -435,7 +439,6 @@ class ParametricCadExtension(omni.ext.IExt):
             return None
 
         type_map = {
-            ConstraintType.COINCIDENT: "coincident",
             ConstraintType.HORIZONTAL_LINE: "horizontal",
             ConstraintType.VERTICAL_LINE: "vertical",
             ConstraintType.PERPENDICULAR: "perpendicular",
@@ -474,7 +477,11 @@ class ParametricCadExtension(omni.ext.IExt):
         cx = sum(xs) / len(xs)
         cy = sum(ys) / len(ys) + 2.0  # slight offset above the geometry
 
-        return {"type": ctype_str, "x": cx, "y": cy, "value": c.value}
+        return {
+            "type": ctype_str, "x": cx, "y": cy, "value": c.value,
+            "usd_path": getattr(c, "usd_path", None),
+            "cid": c.cid,
+        }
 
     def _on_viewport_select_prim(self, usd_path: str, add_to_selection: bool = False):
         """Called when the user clicks a primitive/point in the sketch viewport.
@@ -500,6 +507,18 @@ class ParametricCadExtension(omni.ext.IExt):
         except Exception as e:
             print(f"[SparkWorks] Failed to select {usd_path}: {e}")
 
+    def _on_viewport_background_click(self):
+        """Clicking the viewport background selects the active sketch prim."""
+        if self._active_sketch is None or self._bridge is None:
+            return
+        sketch_path = f"{self._bridge.sketches_root}/{self._active_sketch.name}"
+        try:
+            omni.usd.get_context().get_selection().set_selected_prim_paths(
+                [sketch_path], True
+            )
+        except Exception:
+            pass
+
     def _on_drag_point_path(self, usd_path: str, wx: float, wy: float):
         """
         Handle drag of a point prim in the sketch viewport.
@@ -518,14 +537,18 @@ class ParametricCadExtension(omni.ext.IExt):
         eid = sketch.get_solver_eid_for_usd_path(usd_path)
         if eid is not None:
             # Solver-based drag: moves connected points together
-            ok = sketch.drag_point(eid, wx, wy)
+            try:
+                ok = sketch.drag_point(eid, wx, wy)
+            except Exception as ex:
+                print(f"[SparkWorks] drag_point exception: {ex}")
+                ok = False
             if ok:
                 self._sync_all_sketch_prims_to_usd()
                 # Lightweight position-only refresh during drag
                 self._sketch_viewport.refresh_positions()
         else:
             # Fallback: direct coordinate update (no solver)
-            from .kernel.sketch import SketchLine, SketchRect
+            from .kernel.sketch import SketchLine, SketchRect, SketchCircle
             matched = False
             for prim in sketch.primitives:
                 if isinstance(prim, SketchLine):
@@ -572,9 +595,66 @@ class ParametricCadExtension(omni.ext.IExt):
                             break
                     if matched:
                         break
+                elif isinstance(prim, SketchCircle):
+                    # Edge (radius) handle — resize the circle
+                    if getattr(prim, "edge_usd_path", None) == usd_path:
+                        cx, cy = prim.center
+                        new_r = max(0.1, math.hypot(wx - cx, wy - cy))
+                        prim.radius = new_r
+                        # Update solver circle radius parameter
+                        idx = sketch.primitives.index(prim)
+                        ents = sketch.get_entity_ids_for_primitive(idx)
+                        if sketch.solver and ents and "circle" in ents:
+                            e = sketch.solver.entities[ents["circle"]]
+                            sketch.solver._params[e.param_indices[2]] = new_r
+                        matched = True
+                        self._sync_all_sketch_prims_to_usd()
+                        self._sketch_viewport.refresh_positions()
+                        return
             if self._bridge and not matched:
                 self._bridge.update_point_position(usd_path, wx, wy)
             self._update_sketch_view()
+
+    def _on_drag_line_path(self, usd_path: str, dx: float, dy: float):
+        """
+        Handle drag of a whole line or circle body — translate by delta
+        via the solver, pinning the moved points so they stay with the cursor.
+        """
+        sketch = self._active_sketch
+        if sketch is None:
+            return
+
+        from .kernel.sketch import SketchLine, SketchCircle
+        sketch.ensure_solver()
+
+        for idx, prim in enumerate(sketch.primitives):
+            if getattr(prim, "usd_path", None) != usd_path:
+                continue
+            ents = sketch.get_entity_ids_for_primitive(idx)
+            if not ents or sketch.solver is None:
+                break
+
+            pinned = {}
+            if isinstance(prim, SketchLine):
+                p1_eid = ents.get("p1")
+                p2_eid = ents.get("p2")
+                if p1_eid is not None:
+                    ox, oy = sketch.solver.get_point(p1_eid)
+                    pinned[p1_eid] = (ox + dx, oy + dy)
+                if p2_eid is not None:
+                    ox, oy = sketch.solver.get_point(p2_eid)
+                    pinned[p2_eid] = (ox + dx, oy + dy)
+            elif isinstance(prim, SketchCircle):
+                center_eid = ents.get("center")
+                if center_eid is not None:
+                    ox, oy = sketch.solver.get_point(center_eid)
+                    pinned[center_eid] = (ox + dx, oy + dy)
+
+            sketch.solver.solve_drag_multiple(pinned, max_iter=30)
+            sketch._sync_primitives_from_solver()
+            self._sync_all_sketch_prims_to_usd()
+            self._sketch_viewport.refresh_positions()
+            return
 
     def _sync_all_sketch_prims_to_usd(self):
         """
@@ -584,7 +664,7 @@ class ParametricCadExtension(omni.ext.IExt):
         sketch = self._active_sketch
         if sketch is None or self._bridge is None:
             return
-        from .kernel.sketch import SketchLine, SketchRect
+        from .kernel.sketch import SketchLine, SketchRect, SketchCircle
         for prim in sketch.primitives:
             if isinstance(prim, SketchLine):
                 sp = getattr(prim, "start_usd_path", None)
@@ -599,6 +679,28 @@ class ParametricCadExtension(omni.ext.IExt):
                 for cp_path, (cx, cy) in zip(corner_paths, corners):
                     if cp_path:
                         self._bridge.update_point_position(cp_path, cx, cy)
+            elif isinstance(prim, SketchCircle):
+                # Sync center point (usd_path is the circle prim itself)
+                cp = getattr(prim, "usd_path", None)
+                if cp:
+                    self._bridge.update_point_position(cp, prim.center[0], prim.center[1])
+                    # Also sync radius directly on the circle prim
+                    self._bridge.update_circle_radius(cp, prim.radius)
+                # Sync edge (radius handle) sub-prim
+                ep = getattr(prim, "edge_usd_path", None)
+                if ep:
+                    ex, ey = prim.edge_point
+                    self._bridge.update_point_position(ep, ex, ey)
+        # Keep the 3D curves visual in sync
+        self._refresh_sketch_curves()
+
+    def _refresh_sketch_curves(self):
+        """Rebuild the 3D BasisCurves visual for the active sketch."""
+        sketch = self._active_sketch
+        if sketch is None or self._bridge is None:
+            return
+        sketch_path = f"{self._bridge.sketches_root}/{sketch.name}"
+        self._bridge.write_sketch_curves(sketch_path, sketch)
 
     def _on_snap_join_paths(self, drag_path: str, target_path: str):
         """
@@ -656,11 +758,114 @@ class ParametricCadExtension(omni.ext.IExt):
         # Add a coincident constraint
         solver.constrain_coincident(drag_eid, target_eid)
         sketch.solve_constraints()
+
+        # Write the new coincident constraint to USD
+        if self._bridge and solver.constraints:
+            new_c = solver.constraints[-1]
+            sketch_path = f"{self._bridge.sketches_root}/{sketch.name}"
+            self._bridge.write_constraint_prim(sketch_path, new_c)
+
         self._update_sketch_view()
 
         self._set_status(
             f"Joined points — DOF: {sketch.degrees_of_freedom}"
         )
+
+    # -- Right-click context menu -----------------------------------------------
+
+    def _on_context_menu(self, usd_path: str, screen_x: float, screen_y: float):
+        """
+        Show a context menu when the user right-clicks a sketch element
+        (line, point, or constraint) in the viewport.
+        """
+        import omni.ui as _ui
+
+        sketch = self._active_sketch
+        if sketch is None:
+            return
+
+        # Determine what the path represents
+        label = usd_path.split("/")[-1]
+        menu_items = []
+
+        if "/Constraints/" in usd_path:
+            menu_items.append(("Delete Constraint", lambda p=usd_path: self._delete_constraint_by_path(p)))
+        elif "/Primitives/" in usd_path:
+            # Point sub-prim → offer to delete the parent line
+            point_names = ("StartPt", "EndPt",
+                           "CornerBL", "CornerBR", "CornerTR", "CornerTL")
+            if label in point_names:
+                parent_path = "/".join(usd_path.split("/")[:-1])
+                menu_items.append(("Delete Parent Line", lambda p=parent_path: self._delete_primitive_by_path(p)))
+            else:
+                menu_items.append(("Delete", lambda p=usd_path: self._delete_primitive_by_path(p)))
+
+        if not menu_items:
+            return
+
+        self._context_menu = _ui.Menu("Sketch Context")
+        with self._context_menu:
+            for text, callback in menu_items:
+                _ui.MenuItem(text, triggered_fn=lambda cb=callback: cb())
+        self._context_menu.show()
+
+    def _delete_constraint_by_path(self, usd_path: str):
+        """Delete a constraint identified by its USD prim path."""
+        sketch = self._active_sketch
+        if sketch is None or sketch.solver is None:
+            return
+
+        # Find the constraint with this usd_path
+        target_c = None
+        for c in sketch.solver.constraints:
+            if getattr(c, "usd_path", None) == usd_path:
+                target_c = c
+                break
+        if target_c is None:
+            return
+
+        sketch.remove_constraint(target_c.cid)
+
+        if self._bridge:
+            self._bridge.remove_constraint_prim(usd_path)
+
+        sketch.solve_constraints()
+        self._sync_all_sketch_prims_to_usd()
+        self._update_sketch_view()
+        self._set_status(f"Deleted constraint ({target_c.ctype.name})")
+
+    def _delete_primitive_by_path(self, usd_path: str):
+        """Delete a sketch primitive identified by its USD prim path."""
+        sketch = self._active_sketch
+        if sketch is None:
+            return
+
+        target_idx = None
+        for idx, prim in enumerate(sketch.primitives):
+            if getattr(prim, "usd_path", None) == usd_path:
+                target_idx = idx
+                break
+        if target_idx is None:
+            return
+
+        # Remove from sketch — returns any constraints that were also removed
+        removed_constraints = sketch.remove_primitive(target_idx)
+
+        if self._bridge:
+            stage = self._bridge._get_stage()
+            if stage:
+                # Remove the primitive USD prim
+                stage.RemovePrim(usd_path)
+                # Remove constraint USD prims that depended on deleted entities
+                for rc in removed_constraints:
+                    cp = getattr(rc, "usd_path", None)
+                    if cp:
+                        stage.RemovePrim(cp)
+
+        sketch.solve_constraints()
+        self._sync_all_sketch_prims_to_usd()
+        self._update_sketch_view()
+        self._set_status("Deleted primitive")
 
     def _get_sketch_hidden_indices(self, sketch: Sketch) -> set:
         """Query USD visibility for each primitive prim under the sketch."""
@@ -908,7 +1113,8 @@ class ParametricCadExtension(omni.ext.IExt):
                         # Is it a point sub-prim?
                         # Lines have StartPt/EndPt; Rects have CornerBL/BR/TR/TL
                         point_names = ("StartPt", "EndPt",
-                                       "CornerBL", "CornerBR", "CornerTR", "CornerTL")
+                                       "CornerBL", "CornerBR", "CornerTR", "CornerTL",
+                                       "EdgePt")
                         if len(parts) > 3 and parts[3] in point_names:
                             sketch_sel_types.append("point")
                         elif prim_part.startswith("Line"):
@@ -919,6 +1125,8 @@ class ParametricCadExtension(omni.ext.IExt):
                             sketch_sel_types.append("circle")
                         else:
                             sketch_sel_types.append("other")
+                    elif "/Constraints/" in path:
+                        sketch_sel_types.append("constraint")
                     else:
                         sketch_sel_types.append("sketch_root")
                 continue
@@ -1605,6 +1813,13 @@ class ParametricCadExtension(omni.ext.IExt):
                     )
                     if usd_path:
                         last_usd_path = usd_path
+                # Write auto-generated constraints (H/V + coincident) to USD
+                if self._active_sketch.solver:
+                    self._bridge.write_all_constraint_prims(
+                        sketch_path, self._active_sketch.solver
+                    )
+                # Update 3D curves visual
+                self._refresh_sketch_curves()
                 # Select the last line so the stage shows something highlighted
                 if last_usd_path:
                     try:
@@ -1651,6 +1866,9 @@ class ParametricCadExtension(omni.ext.IExt):
                     )
                 except Exception:
                     pass
+
+        # Update 3D curves visual
+        self._refresh_sketch_curves()
 
         # Auto-detect constraints on the newly created primitive
         self._auto_constrain(prim_idx)
@@ -2185,8 +2403,14 @@ class ParametricCadExtension(omni.ext.IExt):
 
         # Solve and update the view
         ok = sketch.solve_constraints()
-        print(f"[SparkWorks] Constraint '{ctype_name}' solve: {'OK' if ok else 'FAILED'}  DOF={sketch.degrees_of_freedom}")
         self._sync_all_sketch_prims_to_usd()
+
+        # Write the newly added constraint to USD as a selectable prim
+        if self._bridge and solver.constraints:
+            new_c = solver.constraints[-1]
+            sketch_path = f"{self._bridge.sketches_root}/{sketch.name}"
+            self._bridge.write_constraint_prim(sketch_path, new_c)
+
         self._update_sketch_view()
 
         status = f"{ctype_name.title()} constraint added"

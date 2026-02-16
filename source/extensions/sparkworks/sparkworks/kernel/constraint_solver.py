@@ -91,6 +91,8 @@ class Constraint:
     selectors: List[str] = field(default_factory=list)
     # Back-reference for serialisation
     driving: bool = True
+    # USD prim path (set when written to stage)
+    usd_path: Optional[str] = field(default=None, repr=False)
 
     def to_dict(self) -> dict:
         return {
@@ -349,6 +351,27 @@ class ConstraintSolver:
     def remove_constraint(self, cid: int):
         """Remove a constraint by its id."""
         self._constraints = [c for c in self._constraints if c.cid != cid]
+
+    def remove_entities_and_dependents(self, eids: set):
+        """
+        Remove a set of entity IDs and any constraints that reference them.
+
+        Returns the list of removed constraint objects (so callers can
+        clean up USD prims, etc.).
+        """
+        removed_constraints = []
+        kept = []
+        for c in self._constraints:
+            if eids.intersection(c.entity_ids):
+                removed_constraints.append(c)
+            else:
+                kept.append(c)
+        self._constraints = kept
+
+        for eid in eids:
+            self._entities.pop(eid, None)
+
+        return removed_constraints
 
     def clear_constraints(self):
         """Remove all constraints."""
@@ -685,25 +708,37 @@ class ConstraintSolver:
             return True
 
         p0 = np.array(self._params, dtype=np.float64)
-        n = len(p0)
 
-        # Build per-parameter bounds for least_squares
-        lower = np.full(n, -np.inf)
-        upper = np.full(n, np.inf)
-        for i in self._fixed:
-            lower[i] = p0[i]
-            upper[i] = p0[i]
+        # If there are fixed parameters, add them as strong residuals
+        # (equal bounds are not allowed by least_squares TRF).
+        if self._fixed:
+            fix_weight = 1000.0
+            fixed_targets = [(i, p0[i]) for i in self._fixed]
 
-        result = least_squares(
-            lambda x: self._build_residual_vector(x),
-            p0,
-            bounds=(lower, upper),
-            method="trf",
-            max_nfev=max_iter,
-            ftol=tol,
-            xtol=tol,
-            gtol=tol,
-        )
+            def residual_with_fixed(x):
+                base = self._build_residual_vector(x)
+                extras = [fix_weight * (x[i] - tv) for i, tv in fixed_targets]
+                return np.append(base, extras)
+
+            result = least_squares(
+                residual_with_fixed,
+                p0,
+                method="trf",
+                max_nfev=max_iter,
+                ftol=tol,
+                xtol=tol,
+                gtol=tol,
+            )
+        else:
+            result = least_squares(
+                lambda x: self._build_residual_vector(x),
+                p0,
+                method="trf",
+                max_nfev=max_iter,
+                ftol=tol,
+                xtol=tol,
+                gtol=tol,
+            )
 
         self._params = result.x.tolist()
 
@@ -715,19 +750,116 @@ class ConstraintSolver:
         drag_eid: int,
         target_x: float,
         target_y: float,
-        max_iter: int = 30,
+        max_iter: int = 50,
     ) -> bool:
         """
         Solve while dragging a point toward a target position.
 
-        Sets the point to *target* as an initial guess, then runs the
-        solver with a small iteration budget (interactive drag should be
-        fast, not perfect).  The drag target is treated as a *hint* —
-        it biases the solver's starting point but does not add any
-        constraint, so it never conflicts with existing constraints.
+        Pins the dragged point at *target* using a strong drag residual,
+        adds a weak regularization to prevent unconstrained parameters
+        from drifting, then runs least_squares to satisfy geometric
+        constraints while keeping the dragged point at the cursor.
         """
+        e = self._entities.get(drag_eid)
+        if e is None:
+            return False
+
+        # Snapshot positions BEFORE moving the dragged point
+        p0 = np.array(self._params, dtype=np.float64)
+
+        # Move the dragged point to the target
         self.set_point(drag_eid, target_x, target_y)
-        self.solve(max_iter=max_iter)
+
+        if not self._constraints:
+            return True
+
+        ix, iy = e.param_indices[0], e.param_indices[1]
+        pinned = {ix, iy}
+
+        drag_weight = 1000.0
+        reg_weight = 0.01  # gentle spring to prevent drift
+
+        def residual_fn(x):
+            base = self._build_residual_vector(x)
+            drag = [drag_weight * (x[ix] - target_x),
+                    drag_weight * (x[iy] - target_y)]
+            # Regularize non-pinned params toward their pre-drag values
+            reg = [reg_weight * (x[i] - p0[i])
+                   for i in range(len(x)) if i not in pinned]
+            return np.concatenate([base, drag, reg])
+
+        p_start = np.array(self._params, dtype=np.float64)
+
+        result = least_squares(
+            residual_fn,
+            p_start,
+            method="trf",
+            max_nfev=max_iter,
+            ftol=1e-10,
+            xtol=1e-10,
+            gtol=1e-10,
+        )
+
+        self._params = result.x.tolist()
+        return True
+
+    def solve_drag_multiple(
+        self,
+        pinned: dict,
+        max_iter: int = 50,
+    ) -> bool:
+        """
+        Solve with multiple points pinned at given positions.
+
+        Args:
+            pinned: ``{entity_id: (x, y), ...}`` — points to pin.
+            max_iter: Iteration budget.
+        """
+        # Snapshot positions BEFORE moving the pinned points
+        p0 = np.array(self._params, dtype=np.float64)
+
+        for eid, (tx, ty) in pinned.items():
+            self.set_point(eid, tx, ty)
+
+        if not self._constraints:
+            return True
+
+        # Build pin index → target mapping
+        pin_targets = []  # [(param_idx, target_value), ...]
+        pinned_set = set()
+        for eid, (tx, ty) in pinned.items():
+            e = self._entities.get(eid)
+            if e is None:
+                continue
+            pi_x, pi_y = e.param_indices[0], e.param_indices[1]
+            pin_targets.append((pi_x, tx))
+            pin_targets.append((pi_y, ty))
+            pinned_set.add(pi_x)
+            pinned_set.add(pi_y)
+
+        drag_weight = 1000.0
+        reg_weight = 0.01
+
+        def residual_fn(x):
+            base = self._build_residual_vector(x)
+            drag = [drag_weight * (x[pi] - tv) for pi, tv in pin_targets]
+            reg = [reg_weight * (x[i] - p0[i])
+                   for i in range(len(x)) if i not in pinned_set]
+            return np.concatenate([base, drag, reg])
+
+        p_start = np.array(self._params, dtype=np.float64)
+
+        result = least_squares(
+            residual_fn,
+            p_start,
+            method="trf",
+            max_nfev=max_iter,
+            ftol=1e-10,
+            xtol=1e-10,
+            gtol=1e-10,
+        )
+
+        self._params = result.x.tolist()
         return True
 
     # -- Serialisation ---------------------------------------------------------
