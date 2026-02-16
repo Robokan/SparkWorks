@@ -264,12 +264,66 @@ class Sketch:
         height: float,
         center: Tuple[float, float] = (0.0, 0.0),
     ) -> SketchRect:
+        """Add a SketchRect primitive (legacy — prefer add_rectangle_as_lines)."""
         prim = SketchRect(center=center, width=width, height=height)
         idx = len(self.primitives)
         self.primitives.append(prim)
         if self.solver is not None:
             self._register_primitive(idx, prim)
         return prim
+
+    def add_rectangle_as_lines(
+        self,
+        center: Tuple[float, float],
+        width: float,
+        height: float,
+    ) -> List[SketchLine]:
+        """
+        Create a rectangle from 4 lines with auto-applied constraints.
+
+        Returns the 4 SketchLine objects (bottom, right, top, left).
+        The solver gets: horizontal on bottom/top, vertical on left/right,
+        and coincident at all 4 shared corners.
+        """
+        cx, cy = center
+        hw, hh = width / 2.0, height / 2.0
+        bl = (cx - hw, cy - hh)
+        br = (cx + hw, cy - hh)
+        tr = (cx + hw, cy + hh)
+        tl = (cx - hw, cy + hh)
+
+        bottom = self.add_line(bl, br)
+        right  = self.add_line(br, tr)
+        top    = self.add_line(tr, tl)
+        left   = self.add_line(tl, bl)
+        lines = [bottom, right, top, left]
+
+        # Apply structural constraints
+        if self.solver is not None:
+            base_idx = self.primitives.index(bottom)
+            ents = [self._prim_entities.get(base_idx + i, {}) for i in range(4)]
+
+            # Horizontal bottom/top, vertical right/left
+            for i, ctype in [(0, ConstraintType.HORIZONTAL_LINE),
+                             (2, ConstraintType.HORIZONTAL_LINE),
+                             (1, ConstraintType.VERTICAL_LINE),
+                             (3, ConstraintType.VERTICAL_LINE)]:
+                lid = ents[i].get("line")
+                if lid is not None:
+                    self.solver.add_constraint(ctype, [lid])
+
+            # Coincident at shared corners (bottom-end = right-start, etc.)
+            pairs = [(0, "p2", 1, "p1"),   # bottom.end = right.start
+                     (1, "p2", 2, "p1"),   # right.end = top.start
+                     (2, "p2", 3, "p1"),   # top.end = left.start
+                     (3, "p2", 0, "p1")]   # left.end = bottom.start
+            for ia, ka, ib, kb in pairs:
+                pa = ents[ia].get(ka)
+                pb = ents[ib].get(kb)
+                if pa is not None and pb is not None:
+                    self.solver.constrain_coincident(pa, pb)
+
+        return lines
 
     def add_circle(
         self, radius: float, center: Tuple[float, float] = (0.0, 0.0)

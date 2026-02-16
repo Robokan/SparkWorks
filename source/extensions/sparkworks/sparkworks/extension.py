@@ -300,27 +300,36 @@ class ParametricCadExtension(omni.ext.IExt):
         self._selected_profile_indices = indices
 
     def _update_sketch_view(self):
-        """Push the current active sketch's primitives to the sketch viewport."""
-        if self._active_sketch:
-            hidden = self._get_sketch_hidden_indices(self._active_sketch)
-            self._sketch_viewport.update_primitives(
-                self._active_sketch.primitives, hidden
-            )
-            self._sketch_viewport.set_sketch_info(
-                self._active_sketch.plane_name,
-                self._active_sketch.name,
-                len(self._active_sketch.primitives),
-                dof=self._active_sketch.degrees_of_freedom,
-                constraint_count=self._active_sketch.constraint_count,
-            )
-            # Update constraint icons and connected-point highlighting
-            self._update_solver_overlays()
-            self._update_connected_paths()
-        else:
-            self._sketch_viewport.update_primitives([])
-            self._sketch_viewport.update_constraint_data([])
-            self._sketch_viewport.set_connected_paths(set())
-            self._sketch_viewport.clear_info()
+        """Push the current active sketch's primitives to the sketch viewport.
+
+        Wraps all viewport data updates in a batch so that only a single
+        scene redraw occurs, no matter how many sub-calls modify the
+        viewport's internal state.
+        """
+        vp = self._sketch_viewport
+        vp.begin_batch()
+        try:
+            if self._active_sketch:
+                hidden = self._get_sketch_hidden_indices(self._active_sketch)
+                vp.update_primitives(
+                    self._active_sketch.primitives, hidden
+                )
+                vp.set_sketch_info(
+                    self._active_sketch.plane_name,
+                    self._active_sketch.name,
+                    len(self._active_sketch.primitives),
+                    dof=self._active_sketch.degrees_of_freedom,
+                    constraint_count=self._active_sketch.constraint_count,
+                )
+                self._update_solver_overlays()
+                self._update_connected_paths()
+            else:
+                vp.update_primitives([])
+                vp.update_constraint_data([])
+                vp.set_connected_paths(set())
+                vp.clear_info()
+        finally:
+            vp.end_batch()
 
     def _update_connected_paths(self):
         """
@@ -512,7 +521,8 @@ class ParametricCadExtension(omni.ext.IExt):
             ok = sketch.drag_point(eid, wx, wy)
             if ok:
                 self._sync_all_sketch_prims_to_usd()
-                self._update_sketch_view()
+                # Lightweight position-only refresh during drag
+                self._sketch_viewport.refresh_positions()
         else:
             # Fallback: direct coordinate update (no solver)
             from .kernel.sketch import SketchLine, SketchRect
@@ -528,6 +538,26 @@ class ParametricCadExtension(omni.ext.IExt):
                         matched = True
                         break
                 elif isinstance(prim, SketchRect):
+                    # Center marker — translate the whole rectangle
+                    if getattr(prim, "usd_path", None) == usd_path:
+                        dx = wx - prim.center[0]
+                        dy = wy - prim.center[1]
+                        prim.center = (wx, wy)
+                        # Move all solver corner points by the same delta
+                        ents = sketch.get_entity_ids_for_primitive(
+                            sketch.primitives.index(prim)
+                        )
+                        if sketch.solver and ents:
+                            for key in ("p0", "p1", "p2", "p3"):
+                                pid = ents.get(key)
+                                if pid is not None:
+                                    ox, oy = sketch.solver.get_point(pid)
+                                    sketch.solver.set_point(pid, ox + dx, oy + dy)
+                        matched = True
+                        # Sync all corners to USD
+                        self._sync_all_sketch_prims_to_usd()
+                        break
+                    # Corner marker — resize from that corner
                     cpaths = getattr(prim, "corner_usd_paths", None) or []
                     for ci, cp in enumerate(cpaths):
                         if cp == usd_path:
@@ -542,7 +572,7 @@ class ParametricCadExtension(omni.ext.IExt):
                             break
                     if matched:
                         break
-            if self._bridge:
+            if self._bridge and not matched:
                 self._bridge.update_point_position(usd_path, wx, wy)
             self._update_sketch_view()
 
@@ -627,10 +657,6 @@ class ParametricCadExtension(omni.ext.IExt):
         solver.constrain_coincident(drag_eid, target_eid)
         sketch.solve_constraints()
         self._update_sketch_view()
-
-        # Persist
-        if self._bridge:
-            self._bridge.save_sketches(self._sketch_registry)
 
         self._set_status(
             f"Joined points — DOF: {sketch.degrees_of_freedom}"
@@ -1558,15 +1584,46 @@ class ParametricCadExtension(omni.ext.IExt):
 
         from .kernel.sketch import SketchLine, SketchRect, SketchCircle
 
+        if isinstance(primitive, SketchRect):
+            # Rectangle tool emits a SketchRect, but we decompose it into
+            # 4 constrained lines — the standard CAD sketcher approach.
+            lines = self._active_sketch.add_rectangle_as_lines(
+                center=primitive.center,
+                width=primitive.width,
+                height=primitive.height,
+            )
+            # Write all 4 lines to USD
+            first_idx = self._active_sketch.primitives.index(lines[0])
+            if self._bridge:
+                sketch_path = (
+                    f"{self._bridge.sketches_root}/{self._active_sketch.name}"
+                )
+                last_usd_path = None
+                for i, line in enumerate(lines):
+                    usd_path = self._bridge.write_sketch_primitive(
+                        sketch_path, first_idx + i, line
+                    )
+                    if usd_path:
+                        last_usd_path = usd_path
+                # Select the last line so the stage shows something highlighted
+                if last_usd_path:
+                    try:
+                        omni.usd.get_context().get_selection().set_selected_prim_paths(
+                            [last_usd_path], True
+                        )
+                    except Exception:
+                        pass
+            self._update_sketch_view()
+            # Switch to select mode (rectangle is a single-shot tool)
+            self._sketch_tool.on_finish()
+            self._toolbar.set_active_tool(None)
+            self._sketch_viewport.set_select_mode(True)
+            self._select_active_sketch_in_stage()
+            return
+
         if isinstance(primitive, SketchLine):
             self._active_sketch.add_line(
                 start=primitive.start, end=primitive.end
-            )
-        elif isinstance(primitive, SketchRect):
-            self._active_sketch.add_rectangle(
-                width=primitive.width,
-                height=primitive.height,
-                center=primitive.center,
             )
         elif isinstance(primitive, SketchCircle):
             self._active_sketch.add_circle(
@@ -2131,10 +2188,6 @@ class ParametricCadExtension(omni.ext.IExt):
         print(f"[SparkWorks] Constraint '{ctype_name}' solve: {'OK' if ok else 'FAILED'}  DOF={sketch.degrees_of_freedom}")
         self._sync_all_sketch_prims_to_usd()
         self._update_sketch_view()
-
-        # Persist updated sketch
-        if self._bridge:
-            self._bridge.save_sketches(self._sketch_registry)
 
         status = f"{ctype_name.title()} constraint added"
         if not ok:

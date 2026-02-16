@@ -38,7 +38,7 @@ SHAPE_COLOR = ui.color(1.0, 1.0, 1.0) if ui else None           # white lines
 SHAPE_HIGHLIGHT_COLOR = ui.color(1.0, 0.8, 0.2) if ui else None
 PREVIEW_COLOR = ui.color(1.0, 0.5, 0.2, 0.8) if ui else None
 POINT_COLOR = ui.color(0.3, 1.0, 0.4) if ui else None
-SELECTED_COLOR = ui.color(1.0, 1.0, 0.0, 1.0) if ui else None  # yellow for selected
+SELECTED_COLOR = ui.color(0.4, 0.7, 1.0, 1.0) if ui else None  # blue for selected
 POINT_CONNECTED_COLOR = ui.color(0.1, 0.9, 0.1, 1.0) if ui else None   # green — connected
 POINT_DISCONNECTED_COLOR = ui.color(1.0, 0.2, 0.2, 1.0) if ui else None  # red — disconnected
 SNAP_HIGHLIGHT_COLOR = ui.color(0.3, 0.5, 1.0, 1.0) if ui else None     # blue — snap candidate
@@ -101,6 +101,12 @@ class SketchViewport:
         self._selected_paths: Set[str] = set()
         self._connected_paths: Set[str] = set()  # points with coincident constraints
         self._prim_constraint_labels: Dict[int, List[str]] = {}  # prim_idx → ["H", "∥"]
+
+        # Batch redraw — prevents redundant scene rebuilds when multiple
+        # data updates happen in quick succession (e.g. _update_sketch_view
+        # pushes primitives + constraints + connected paths).
+        self._batch_depth: int = 0
+        self._batch_dirty: bool = False
 
         # Drag state — driven by selecting a point in the stage
         self._drag_path: Optional[str] = None  # USD path of point being dragged
@@ -178,6 +184,26 @@ class SketchViewport:
             self._window.destroy()
             self._window = None
 
+    # -- Batch redraw ---------------------------------------------------------
+
+    def begin_batch(self):
+        """Defer ``_redraw`` calls until the matching ``end_batch``."""
+        self._batch_depth += 1
+
+    def end_batch(self):
+        """Complete a batch; redraw once if any update marked dirty."""
+        self._batch_depth = max(0, self._batch_depth - 1)
+        if self._batch_depth == 0 and self._batch_dirty:
+            self._batch_dirty = False
+            self._redraw()
+
+    def _request_redraw(self):
+        """Schedule a redraw — deferred while inside a batch."""
+        if self._batch_depth > 0:
+            self._batch_dirty = True
+        else:
+            self._redraw()
+
     # -- Public API -----------------------------------------------------------
 
     def set_sketch_info(self, plane_name: str, name: str, count: int,
@@ -200,8 +226,12 @@ class SketchViewport:
             return
         self._primitives = primitives
         self._hidden_indices = hidden_indices or set()
+        # Clear stale selection when primitive set changes (e.g. sketch
+        # closed and reopened) so highlighting doesn't carry over.
+        if not primitives:
+            self._selected_paths.clear()
         self._rebuild_hit_maps()
-        self._redraw()
+        self._request_redraw()
 
     def set_preview_line(
         self,
@@ -210,7 +240,7 @@ class SketchViewport:
     ):
         self._preview_from = from_pt
         self._preview_to = to_pt
-        self._redraw()
+        self._request_redraw()
 
     def set_placed_points(self, points: List[Tuple[float, float]]):
         self._placed_points = list(points)
@@ -223,7 +253,7 @@ class SketchViewport:
         """Set a rectangle preview (two opposite corners)."""
         self._preview_rect_c1 = corner1
         self._preview_rect_c2 = corner2
-        self._redraw()
+        self._request_redraw()
 
     def set_select_mode(self, active: bool):
         """Enable/disable select mode (point dragging)."""
@@ -234,10 +264,12 @@ class SketchViewport:
         Set the USD paths that should be highlighted.
 
         Called by the extension when the stage selection changes.
+        Paths are normalised to plain strings so comparisons with
+        ``_prim_paths`` (which are Python str) always work, even if
+        the stage selection returns ``Sdf.Path`` objects.
         """
-        if paths != self._selected_paths:
-            self._selected_paths = set(paths)
-            self._redraw()
+        self._selected_paths = {str(p) for p in paths}
+        self._request_redraw()
 
     def set_connected_paths(self, paths: Set[str]):
         """
@@ -247,7 +279,7 @@ class SketchViewport:
         """
         if paths != self._connected_paths:
             self._connected_paths = set(paths)
-            self._redraw()
+            self._request_redraw()
 
     def set_prim_constraint_labels(self, labels: Dict[int, List[str]]):
         """
@@ -267,7 +299,7 @@ class SketchViewport:
         Each dict should have ``type`` (str), ``x`` (float), ``y`` (float).
         """
         self._constraint_data = list(data)
-        self._redraw()
+        self._request_redraw()
 
     def clear_preview(self):
         self._preview_from = None
@@ -275,7 +307,7 @@ class SketchViewport:
         self._preview_rect_c1 = None
         self._preview_rect_c2 = None
         self._placed_points = []
-        self._redraw()
+        self._request_redraw()
 
     # -- Hit-map management ---------------------------------------------------
 
@@ -302,6 +334,9 @@ class SketchViewport:
                 if ep:
                     self._point_positions[ep] = prim.end
             elif isinstance(prim, SketchRect):
+                # Center point (for whole-rectangle dragging)
+                if usd_path:
+                    self._point_positions[usd_path] = prim.center
                 # Corner points
                 corner_paths = getattr(prim, "corner_usd_paths", None)
                 if corner_paths:
@@ -313,6 +348,39 @@ class SketchViewport:
                 # Center point is the primitive path itself
                 if usd_path:
                     self._point_positions[usd_path] = prim.center
+
+    def refresh_positions(self):
+        """
+        Lightweight position-only refresh for drag operations.
+
+        Updates point handle positions from the current primitive data
+        *without* rebuilding the full hit maps or prim-path dictionaries
+        (topology is unchanged during a drag).
+        """
+        from ..kernel.sketch import SketchLine, SketchRect, SketchCircle
+        for i, prim in enumerate(self._primitives):
+            if isinstance(prim, SketchLine):
+                sp = getattr(prim, "start_usd_path", None)
+                ep = getattr(prim, "end_usd_path", None)
+                if sp:
+                    self._point_positions[sp] = prim.start
+                if ep:
+                    self._point_positions[ep] = prim.end
+            elif isinstance(prim, SketchRect):
+                usd_path = getattr(prim, "usd_path", None)
+                if usd_path:
+                    self._point_positions[usd_path] = prim.center
+                corner_paths = getattr(prim, "corner_usd_paths", None)
+                if corner_paths:
+                    corners = prim.corners
+                    for cp_path, corner_pos in zip(corner_paths, corners):
+                        if cp_path:
+                            self._point_positions[cp_path] = corner_pos
+            elif isinstance(prim, SketchCircle):
+                usd_path = getattr(prim, "usd_path", None)
+                if usd_path:
+                    self._point_positions[usd_path] = prim.center
+        self._request_redraw()
 
     # -- Projection / aspect-ratio management --------------------------------
 
@@ -468,7 +536,7 @@ class SketchViewport:
         old = self._snap_target_path
         self._snap_target_path = best_path
         if old != best_path:
-            self._redraw()  # highlight change
+            self._request_redraw()
 
     # -- Mouse / keyboard handlers -------------------------------------------
 
@@ -488,7 +556,7 @@ class SketchViewport:
             # If released on a snap target, fire the join callback
             if snap_path is not None and drag_path is not None and self.on_snap_join:
                 self.on_snap_join(drag_path, snap_path)
-            self._redraw()
+            self._request_redraw()
             return
 
         # In select mode, try to select a prim by clicking
@@ -577,14 +645,7 @@ class SketchViewport:
                     # Highlight if this prim's USD path is selected
                     prim_path = self._prim_paths.get(i)
                     is_selected = prim_path is not None and prim_path in self._selected_paths
-                    # Constrained lines get a subtle cyan tint
-                    has_constraints = i in self._prim_constraint_labels
-                    if is_selected:
-                        color = SELECTED_COLOR
-                    elif has_constraints:
-                        color = CONSTRAINT_LINE_COLOR
-                    else:
-                        color = SHAPE_COLOR
+                    color = SELECTED_COLOR if is_selected else SHAPE_COLOR
                     self._draw_primitive(prim, color)
 
                     # Draw constraint label at the midpoint of the line

@@ -2,17 +2,19 @@
 2D Geometric Constraint Solver — pure-Python, scipy-based.
 
 Inspired by FreeCAD's PlaneGCS architecture but built from scratch using
-``scipy.optimize.minimize`` so we have zero native dependencies beyond
+``scipy.optimize.least_squares`` so we have zero native dependencies beyond
 what's already in the Isaac Sim container.
 
 Architecture
 ------------
 * Each geometric entity (point, line, circle, arc) stores its parameters
   as indices into a flat parameter vector ``params[]``.
-* Each constraint is a callable that returns a residual (scalar) — zero
-  means satisfied.
-* ``solve()`` minimises the sum of squared residuals using L-BFGS-B,
-  honouring any fixed-parameter bounds.
+* Each constraint produces one or more *linear* residuals — zero means
+  satisfied.
+* ``solve()`` minimises the sum of squared residuals using
+  ``least_squares`` (Trust Region Reflective), which is dramatically
+  faster than the previous L-BFGS-B approach because it works with the
+  full residual vector and computes the Jacobian efficiently.
 
 Supported constraints
 ---------------------
@@ -29,7 +31,7 @@ from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import least_squares
 
 
 # =========================================================================
@@ -457,71 +459,76 @@ class ConstraintSolver:
 
     # -- Residual evaluation ---------------------------------------------------
 
-    def _build_residuals(self, p: np.ndarray) -> np.ndarray:
-        """Evaluate all constraint residuals at parameter vector *p*."""
-        residuals = []
+    def _build_residual_vector(self, p: np.ndarray) -> np.ndarray:
+        """
+        Build the full residual vector for ``least_squares``.
+
+        Each constraint contributes one or more *linear* residuals (not
+        squared).  ``least_squares`` internally minimises the sum of their
+        squares, so the mathematical problem is identical to before but
+        convergence is dramatically faster.
+        """
+        residuals: List[float] = []
         for c in self._constraints:
             if not c.driving:
                 continue
-            r = self._eval_constraint(c, p)
-            residuals.append(r)
+            residuals.extend(self._eval_residuals(c, p))
         return np.array(residuals, dtype=np.float64) if residuals else np.array([0.0])
 
-    def _eval_constraint(self, c: Constraint, p: np.ndarray) -> float:
-        """Evaluate a single constraint residual."""
+    def _eval_residuals(self, c: Constraint, p: np.ndarray) -> List[float]:
+        """
+        Evaluate a single constraint and return a list of *linear*
+        residual components.  Each component is zero when the constraint
+        is satisfied.
+        """
         eids = c.entity_ids
-        sels = c.selectors + [""] * (len(eids) - len(c.selectors))  # pad
+        sels = c.selectors + [""] * (len(eids) - len(c.selectors))
 
         if c.ctype == ConstraintType.COINCIDENT:
             ix_a, iy_a = self._resolve_point(eids[0], sels[0])
             ix_b, iy_b = self._resolve_point(eids[1], sels[1])
-            return (p[ix_a] - p[ix_b]) ** 2 + (p[iy_a] - p[iy_b]) ** 2
+            return [p[ix_a] - p[ix_b], p[iy_a] - p[iy_b]]
 
         if c.ctype == ConstraintType.HORIZONTAL_LINE:
             e = self._entities[eids[0]]
             pi = e.param_indices
-            return (p[pi[1]] - p[pi[3]]) ** 2  # y1 == y2
+            return [p[pi[1]] - p[pi[3]]]
 
         if c.ctype == ConstraintType.VERTICAL_LINE:
             e = self._entities[eids[0]]
             pi = e.param_indices
-            return (p[pi[0]] - p[pi[2]]) ** 2  # x1 == x2
+            return [p[pi[0]] - p[pi[2]]]
 
         if c.ctype == ConstraintType.HORIZONTAL:
             ix_a, iy_a = self._resolve_point(eids[0], sels[0])
             ix_b, iy_b = self._resolve_point(eids[1], sels[1])
-            return (p[iy_a] - p[iy_b]) ** 2
+            return [p[iy_a] - p[iy_b]]
 
         if c.ctype == ConstraintType.VERTICAL:
             ix_a, iy_a = self._resolve_point(eids[0], sels[0])
             ix_b, iy_b = self._resolve_point(eids[1], sels[1])
-            return (p[ix_a] - p[ix_b]) ** 2
+            return [p[ix_a] - p[ix_b]]
 
         if c.ctype == ConstraintType.DISTANCE_PP:
             ix_a, iy_a = self._resolve_point(eids[0], sels[0])
             ix_b, iy_b = self._resolve_point(eids[1], sels[1])
             dx = p[ix_a] - p[ix_b]
             dy = p[iy_a] - p[iy_b]
-            dist_sq = dx * dx + dy * dy
-            target_sq = c.value * c.value
-            return (dist_sq - target_sq) ** 2
+            dist = math.sqrt(dx * dx + dy * dy)
+            return [dist - c.value]
 
         if c.ctype == ConstraintType.DISTANCE_PL:
-            # Point
             ix_p, iy_p = self._resolve_point(eids[0], "")
-            # Line
             e_line = self._entities[eids[1]]
             lp = e_line.param_indices
-            # Line direction
             lx1, ly1, lx2, ly2 = p[lp[0]], p[lp[1]], p[lp[2]], p[lp[3]]
             dx = lx2 - lx1
             dy = ly2 - ly1
             length_sq = dx * dx + dy * dy
             if length_sq < 1e-20:
-                return 0.0
-            # Signed distance from point to line
+                return [0.0]
             signed_dist = ((p[ix_p] - lx1) * dy - (p[iy_p] - ly1) * dx) / math.sqrt(length_sq)
-            return (signed_dist - c.value) ** 2
+            return [signed_dist - c.value]
 
         if c.ctype == ConstraintType.ANGLE_LL:
             e_a = self._entities[eids[0]]
@@ -531,14 +538,12 @@ class ConstraintSolver:
             dy_a = p[pa[3]] - p[pa[1]]
             dx_b = p[pb[2]] - p[pb[0]]
             dy_b = p[pb[3]] - p[pb[1]]
-            # Angle via atan2 difference
             angle_a = math.atan2(dy_a, dx_a)
             angle_b = math.atan2(dy_b, dx_b)
             diff = angle_a - angle_b
             target = math.radians(c.value)
-            # Wrap to [-pi, pi]
             err = math.atan2(math.sin(diff - target), math.cos(diff - target))
-            return err * err
+            return [err]
 
         if c.ctype == ConstraintType.PERPENDICULAR:
             e_a = self._entities[eids[0]]
@@ -548,8 +553,7 @@ class ConstraintSolver:
             dy_a = p[pa[3]] - p[pa[1]]
             dx_b = p[pb[2]] - p[pb[0]]
             dy_b = p[pb[3]] - p[pb[1]]
-            dot = dx_a * dx_b + dy_a * dy_b
-            return dot * dot
+            return [dx_a * dx_b + dy_a * dy_b]
 
         if c.ctype == ConstraintType.PARALLEL:
             e_a = self._entities[eids[0]]
@@ -559,24 +563,22 @@ class ConstraintSolver:
             dy_a = p[pa[3]] - p[pa[1]]
             dx_b = p[pb[2]] - p[pb[0]]
             dy_b = p[pb[3]] - p[pb[1]]
-            cross = dx_a * dy_b - dy_a * dx_b
-            return cross * cross
+            return [dx_a * dy_b - dy_a * dx_b]
 
         if c.ctype == ConstraintType.EQUAL_LENGTH:
             e_a = self._entities[eids[0]]
             e_b = self._entities[eids[1]]
             pa, pb = e_a.param_indices, e_b.param_indices
-            len_a_sq = (p[pa[2]] - p[pa[0]]) ** 2 + (p[pa[3]] - p[pa[1]]) ** 2
-            len_b_sq = (p[pb[2]] - p[pb[0]]) ** 2 + (p[pb[3]] - p[pb[1]]) ** 2
-            return (len_a_sq - len_b_sq) ** 2
+            len_a = math.sqrt((p[pa[2]] - p[pa[0]]) ** 2 + (p[pa[3]] - p[pa[1]]) ** 2)
+            len_b = math.sqrt((p[pb[2]] - p[pb[0]]) ** 2 + (p[pb[3]] - p[pb[1]]) ** 2)
+            return [len_a - len_b]
 
         if c.ctype == ConstraintType.RADIUS:
             e = self._entities[eids[0]]
-            r_idx = e.param_indices[2]  # radius is 3rd param for circles
-            return (p[r_idx] - c.value) ** 2
+            r_idx = e.param_indices[2]
+            return [p[r_idx] - c.value]
 
         if c.ctype == ConstraintType.TANGENT_LC:
-            # Line tangent to circle: |signed_dist(center, line)| == radius
             e_line = self._entities[eids[0]]
             e_circ = self._entities[eids[1]]
             lp = e_line.param_indices
@@ -586,9 +588,9 @@ class ConstraintSolver:
             dx, dy = lx2 - lx1, ly2 - ly1
             length_sq = dx * dx + dy * dy
             if length_sq < 1e-20:
-                return 0.0
+                return [0.0]
             signed_dist = ((ccx - lx1) * dy - (ccy - ly1) * dx) / math.sqrt(length_sq)
-            return (signed_dist * signed_dist - cr * cr) ** 2
+            return [abs(signed_dist) - cr]
 
         if c.ctype == ConstraintType.TANGENT_CC:
             e_a = self._entities[eids[0]]
@@ -596,13 +598,12 @@ class ConstraintSolver:
             pa, pb = e_a.param_indices, e_b.param_indices
             dx = p[pa[0]] - p[pb[0]]
             dy = p[pa[1]] - p[pb[1]]
-            dist_sq = dx * dx + dy * dy
+            dist = math.sqrt(dx * dx + dy * dy)
             r_sum = p[pa[2]] + p[pb[2]]
             r_diff = abs(p[pa[2]] - p[pb[2]])
-            # External or internal tangency
-            err_ext = (dist_sq - r_sum * r_sum) ** 2
-            err_int = (dist_sq - r_diff * r_diff) ** 2
-            return min(err_ext, err_int)
+            err_ext = dist - r_sum
+            err_int = dist - r_diff
+            return [err_ext] if abs(err_ext) < abs(err_int) else [err_int]
 
         if c.ctype == ConstraintType.POINT_ON_LINE:
             ix_p, iy_p = self._resolve_point(eids[0], "")
@@ -612,36 +613,34 @@ class ConstraintSolver:
             dx, dy = lx2 - lx1, ly2 - ly1
             length_sq = dx * dx + dy * dy
             if length_sq < 1e-20:
-                return 0.0
+                return [0.0]
             cross = (p[ix_p] - lx1) * dy - (p[iy_p] - ly1) * dx
-            return cross * cross / length_sq
+            return [cross / math.sqrt(length_sq)]
 
         if c.ctype == ConstraintType.FIXED:
             ix, iy = self._resolve_point(eids[0], "")
             tx = float(sels[0]) if len(sels) > 0 and sels[0] else p[ix]
             ty = float(sels[1]) if len(sels) > 1 and sels[1] else p[iy]
-            return (p[ix] - tx) ** 2 + (p[iy] - ty) ** 2
+            return [p[ix] - tx, p[iy] - ty]
 
         if c.ctype == ConstraintType.SYMMETRIC:
-            # Points A, B symmetric about line L
             ix_a, iy_a = self._resolve_point(eids[0], "")
             ix_b, iy_b = self._resolve_point(eids[1], "")
             e_line = self._entities[eids[2]]
             lp = e_line.param_indices
             lx1, ly1, lx2, ly2 = p[lp[0]], p[lp[1]], p[lp[2]], p[lp[3]]
-            # Midpoint of A,B should lie on the line
             mx = (p[ix_a] + p[ix_b]) / 2.0
             my = (p[iy_a] + p[iy_b]) / 2.0
             dx, dy = lx2 - lx1, ly2 - ly1
             length_sq = dx * dx + dy * dy
             if length_sq < 1e-20:
-                return 0.0
-            cross_mid = (mx - lx1) * dy - (my - ly1) * dx
-            # AB direction should be perpendicular to line
+                return [0.0, 0.0]
+            inv_len = 1.0 / math.sqrt(length_sq)
+            cross_mid = ((mx - lx1) * dy - (my - ly1) * dx) * inv_len
             abx = p[ix_b] - p[ix_a]
             aby = p[iy_b] - p[iy_a]
-            dot_perp = abx * dx + aby * dy
-            return (cross_mid * cross_mid / length_sq) + (dot_perp * dot_perp / length_sq)
+            dot_perp = (abx * dx + aby * dy) * inv_len
+            return [cross_mid, dot_perp]
 
         if c.ctype == ConstraintType.MIDPOINT:
             ix_p, iy_p = self._resolve_point(eids[0], "")
@@ -649,15 +648,31 @@ class ConstraintSolver:
             lp = e_line.param_indices
             mx = (p[lp[0]] + p[lp[2]]) / 2.0
             my = (p[lp[1]] + p[lp[3]]) / 2.0
-            return (p[ix_p] - mx) ** 2 + (p[iy_p] - my) ** 2
+            return [p[ix_p] - mx, p[iy_p] - my]
 
-        return 0.0
+        return [0.0]
+
+    def _eval_constraint_error(self, c: Constraint, p: np.ndarray) -> float:
+        """Scalar error for diagnostics: sum of squared linear residuals."""
+        residuals = self._eval_residuals(c, p)
+        return sum(r * r for r in residuals)
 
     # -- Solver ---------------------------------------------------------------
 
-    def solve(self, max_iter: int = 500, tol: float = 1e-12) -> bool:
+    def _already_satisfied(self, tol: float = 1e-8) -> bool:
+        """Fast check: are all constraints satisfied within *tol*?"""
+        p = np.array(self._params, dtype=np.float64)
+        for c in self._constraints:
+            if not c.driving:
+                continue
+            for r in self._eval_residuals(c, p):
+                if abs(r) > tol:
+                    return False
+        return True
+
+    def solve(self, max_iter: int = 100, tol: float = 1e-10) -> bool:
         """
-        Solve the constraint system.
+        Solve the constraint system using ``least_squares`` (TRF).
 
         Returns ``True`` if all constraints are satisfied within *tol*.
         The internal parameter vector is updated in-place.
@@ -665,35 +680,34 @@ class ConstraintSolver:
         if not self._constraints:
             return True
 
+        # Skip the solver entirely when already converged
+        if self._already_satisfied(tol=1e-8):
+            return True
+
         p0 = np.array(self._params, dtype=np.float64)
         n = len(p0)
 
-        # Build bounds: fixed params get tight bounds, free params are unbounded
-        bounds = []
-        for i in range(n):
-            if i in self._fixed:
-                bounds.append((p0[i], p0[i]))
-            else:
-                bounds.append((None, None))
+        # Build per-parameter bounds for least_squares
+        lower = np.full(n, -np.inf)
+        upper = np.full(n, np.inf)
+        for i in self._fixed:
+            lower[i] = p0[i]
+            upper[i] = p0[i]
 
-        def objective(x):
-            residuals = self._build_residuals(x)
-            return float(np.sum(residuals))
-
-        result = minimize(
-            objective,
+        result = least_squares(
+            lambda x: self._build_residual_vector(x),
             p0,
-            method="L-BFGS-B",
-            bounds=bounds,
-            options={"maxiter": max_iter, "ftol": tol},
+            bounds=(lower, upper),
+            method="trf",
+            max_nfev=max_iter,
+            ftol=tol,
+            xtol=tol,
+            gtol=tol,
         )
 
-        # Update params from result
         self._params = result.x.tolist()
 
-        # Check convergence: all residuals below tolerance
-        final_residuals = self._build_residuals(result.x)
-        max_residual = float(np.max(np.abs(final_residuals)))
+        max_residual = float(np.max(np.abs(result.fun)))
         return max_residual < 1e-6
 
     def solve_drag(
@@ -701,19 +715,16 @@ class ConstraintSolver:
         drag_eid: int,
         target_x: float,
         target_y: float,
-        max_iter: int = 200,
+        max_iter: int = 30,
     ) -> bool:
         """
         Solve while dragging a point toward a target position.
 
         Sets the point to *target* as an initial guess, then runs the
-        solver.  Existing constraints move the point to the nearest
-        feasible position.  The drag target is treated as a *hint*
-        — it biases the solver's starting point but does not add any
+        solver with a small iteration budget (interactive drag should be
+        fast, not perfect).  The drag target is treated as a *hint* —
+        it biases the solver's starting point but does not add any
         constraint, so it never conflicts with existing constraints.
-
-        Returns ``True`` always (drag is best-effort: the solver either
-        finds a nearby feasible position or leaves the point where it is).
         """
         self.set_point(drag_eid, target_x, target_y)
         self.solve(max_iter=max_iter)
@@ -762,11 +773,11 @@ class ConstraintSolver:
     # -- Diagnostic -----------------------------------------------------------
 
     def constraint_errors(self) -> List[Tuple[int, float]]:
-        """Return (cid, error) for each constraint."""
+        """Return (cid, error) for each constraint (sum of squared residuals)."""
         p = np.array(self._params, dtype=np.float64)
         result = []
         for c in self._constraints:
-            err = self._eval_constraint(c, p)
+            err = self._eval_constraint_error(c, p)
             result.append((c.cid, float(err)))
         return result
 
