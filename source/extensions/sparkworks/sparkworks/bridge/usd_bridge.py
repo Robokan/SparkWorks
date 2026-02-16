@@ -1325,7 +1325,7 @@ class UsdBridge:
         curves.GetPointsAttr().Set(Vt.Vec3fArray(all_points))
         curves.GetCurveVertexCountsAttr().Set(Vt.IntArray(curve_counts))
         curves.GetTypeAttr().Set(UsdGeom.Tokens.linear)
-        curves.GetWidthsAttr().Set(Vt.FloatArray([1.0] * len(all_points)))
+        curves.GetWidthsAttr().Set(Vt.FloatArray([0.15] * len(all_points)))
         curves.GetWidthsInterpolation()  # default vertex
 
         # Sketch-like display colour (light blue)
@@ -1333,7 +1333,7 @@ class UsdBridge:
         color_pv = primvars.CreatePrimvar(
             "displayColor", Sdf.ValueTypeNames.Color3fArray
         )
-        color_pv.Set(Vt.Vec3fArray([Gf.Vec3f(0.2, 0.6, 1.0)]))
+        color_pv.Set(Vt.Vec3fArray([Gf.Vec3f(0.5, 0.5, 0.5)]))
 
     def _write_sketch_attrs(self, stage, prim_path: str, prim, sketch):
         """Write sketch-specific attributes and primitive children."""

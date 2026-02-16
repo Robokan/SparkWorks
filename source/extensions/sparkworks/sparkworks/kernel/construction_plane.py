@@ -126,20 +126,37 @@ class ConstructionPlane:
         2D sketch coordinates to 3D::
 
             world_pt = origin + x * U + y * V
+
+        The vectors match the build123d Plane convention so that sketch
+        x/y map to the same world axes as the geometry kernel.
         """
-        nx, ny, nz = self.normal
-        if abs(nx) < 0.9:
-            ref = (1.0, 0.0, 0.0)
+        _STANDARD = {
+            "XY": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+            "XZ": ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+            "YZ": ((0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+        }
+        key = self.plane_type.upper()
+        if key in _STANDARD:
+            (ux, uy, uz), (vx, vy, vz) = _STANDARD[key]
         else:
-            ref = (0.0, 1.0, 0.0)
-        ux = ny * ref[2] - nz * ref[1]
-        uy = nz * ref[0] - nx * ref[2]
-        uz = nx * ref[1] - ny * ref[0]
-        mag = math.sqrt(ux * ux + uy * uy + uz * uz) or 1.0
-        ux, uy, uz = ux / mag, uy / mag, uz / mag
-        vx = ny * uz - nz * uy
-        vy = nz * ux - nx * uz
-        vz = nx * uy - ny * ux
+            # CUSTOM plane — derive from normal
+            nx, ny, nz = self.normal
+            if abs(nz) > 0.9:
+                ref = (1.0, 0.0, 0.0)
+            elif abs(ny) > 0.9:
+                ref = (1.0, 0.0, 0.0)
+            else:
+                ref = (0.0, 1.0, 0.0)
+            # U = ref - (ref . normal) * normal, then normalise
+            dot = ref[0] * nx + ref[1] * ny + ref[2] * nz
+            ux, uy, uz = ref[0] - dot * nx, ref[1] - dot * ny, ref[2] - dot * nz
+            mag = math.sqrt(ux * ux + uy * uy + uz * uz) or 1.0
+            ux, uy, uz = ux / mag, uy / mag, uz / mag
+            # V = normal x U
+            vx = ny * uz - nz * uy
+            vy = nz * ux - nx * uz
+            vz = nx * uy - ny * ux
+
         if self.rotation != 0.0:
             rad = math.radians(self.rotation)
             cos_a, sin_a = math.cos(rad), math.sin(rad)
